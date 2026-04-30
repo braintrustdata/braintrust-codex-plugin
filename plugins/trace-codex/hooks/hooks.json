@@ -1,0 +1,124 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
+            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ]
+  }
+}
