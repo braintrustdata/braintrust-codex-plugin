@@ -1,0 +1,9 @@
+{
+    "mcpServers": {
+        "braintrust": {
+        "type": "http",
+        "url": "https://api.braintrust.dev/mcp",
+        "note": "Official Braintrust MCP server. Uses OAuth on first connection. Braintrust also supports API-key bearer auth; Codex TOML can configure bearer_token_env_var = \"BRAINTRUST_API_KEY\". For EU data plane, use https://api-eu.braintrust.dev/mcp."
+    }
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "name": "braintrust",
+  "version": "0.1.0",
+  "description": "Access Braintrust docs, logs, experiments, datasets, prompts, schemas, SQL queries, and permalinks through the official Braintrust MCP server.",
+  "author": {
+    "name": "Braintrust",
+    "url": "https://www.braintrust.dev/"
+  },
+  "homepage": "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+  "repository": "https://github.com/braintrustdata/braintrust",
+  "keywords": [
+    "braintrust",
+    "mcp",
+    "evals",
+    "observability",
+    "tracing",
+    "experiments",
+    "datasets",
+    "prompts",
+    "logs"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Braintrust",
+    "shortDescription": "Query Braintrust evals, logs, docs, and traces",
+    "longDescription": "Use the official Braintrust MCP server from Codex to search Braintrust documentation, resolve object names and URLs, inspect schemas, query experiments and logs with SQL, summarize experiment results, and generate shareable permalinks.",
+    "developerName": "Braintrust",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive"
+    ],
+    "websiteURL": "https://www.braintrust.dev/",
+    "privacyPolicyURL": "https://www.braintrust.dev/legal/privacy-policy",
+    "termsOfServiceURL": "https://www.braintrust.dev/legal/terms-of-service",
+    "defaultPrompt": [
+      "Summarize my latest experiment results and compare them against the baseline.",
+      "Find recent production log traces with errors or low scores and give me shareable links to the worst ones.",
+      "How do I add Braintrust tracing to my app and run my first eval? Walk me through the SDK quickstart."
+    ],
+    "brandColor": "#2C1FEB",
+    "composerIcon": "./assets/favicon.svg",
+    "logo": "./assets/logo.png",
+    "screenshots": []
+  }
+}
