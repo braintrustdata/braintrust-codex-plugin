@@ -1,0 +1,33 @@
+{
+  "name": "trace-codex",
+  "version": "0.1.0",
+  "description": "Trace Codex sessions to Braintrust (session, turn, and tool spans).",
+  "author": {
+    "name": "Braintrust",
+    "url": "https://www.braintrust.dev/"
+  },
+  "homepage": "https://www.braintrust.dev/docs",
+  "license": "MIT",
+  "keywords": [
+    "braintrust",
+    "tracing",
+    "observability",
+    "codex",
+    "hooks"
+  ],
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Trace Codex",
+    "shortDescription": "Trace Codex sessions to Braintrust",
+    "longDescription": "Opt-in plugin that traces Codex sessions to Braintrust as session, turn, and tool spans via Codex lifecycle hooks.",
+    "developerName": "Braintrust",
+    "category": "Observability",
+    "capabilities": [
+      "Read"
+    ],
+    "websiteURL": "https://www.braintrust.dev/",
+    "privacyPolicyURL": "https://www.braintrust.dev/legal/privacy-policy",
+    "termsOfServiceURL": "https://www.braintrust.dev/legal/terms-of-service",
+    "brandColor": "#2C1FEB"
+  }
+}

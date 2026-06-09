@@ -1,0 +1,32 @@
+{
+  "name": "braintrust-codex-plugins",
+  "interface": {
+    "displayName": "Braintrust Codex Plugins"
+  },
+  "plugins": [
+    {
+      "name": "braintrust",
+      "source": {
+        "source": "local",
+        "path": "./plugins/braintrust-codex-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer tools"
+    },
+    {
+      "name": "trace-codex",
+      "source": {
+        "source": "local",
+        "path": "./plugins/trace-codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Observability"
+    }
+  ]
+}
