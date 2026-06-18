@@ -1,0 +1,8 @@
+node_modules/
+# Built binaries are downloaded at runtime / built locally, never committed.
+# The launcher scripts (bin/codex-hook.sh, bin/codex-hook.cmd) are tracked.
+bin/codex-hook
+bin/codex-hook-*
+*.log
+# Local user settings; the tracked template is config.json.example.
+config.json

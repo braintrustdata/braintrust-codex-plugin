@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy this file to your plugin data dir as config.json (e.g. ~/.codex/plugins/data/trace-codex-<marketplace>/config.json) and fill in your values. All keys are optional. Environment variables override these values. See README.md for details.",
+  "traceToBraintrust": true,
+  "apiKey": "sk-...",
+  "apiUrl": "https://api.braintrust.dev",
+  "appUrl": "https://www.braintrust.dev",
+  "project": "my-codex-project",
+  "additionalMetadata": { "team": "platform", "env": "dev" },
+  "recordFile": "",
+  "port": 52734,
+  "idleTimeoutMs": 300000,
+  "idleCheckIntervalMs": 30000
+}
