@@ -28,16 +28,20 @@ jobs:
             exit 1
           fi
 
-      - name: Validate version format
+      - name: Validate version and set tag
+        id: vars
         run: |
-          if ! printf '%s' "${{ inputs.version }}" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "::error::Version '${{ inputs.version }}' is not valid semver (expected MAJOR.MINOR.PATCH, no leading v)."
+          # Accept an optional leading 'v' (e.g. v0.0.1 or 0.0.1); the intent is
+          # the same. Normalize to a bare MAJOR.MINOR.PATCH for the manifest, and
+          # derive the tag from it.
+          raw="${{ inputs.version }}"
+          version="${raw#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Version '$raw' is not valid semver (expected MAJOR.MINOR.PATCH, with or without a leading v)."
             exit 1
           fi
-
-      - name: Set tag
-        id: vars
-        run: echo "tag=trace-codex-v${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=trace-codex-v$version" >> "$GITHUB_OUTPUT"
 
       - name: Ensure tag does not already exist
         run: |
@@ -54,19 +58,19 @@ jobs:
       - name: Update plugin manifest version
         run: |
           tmp="$(mktemp)"
-          sed -E 's/("version"[[:space:]]*:[[:space:]]*")[^"]*(")/\1${{ inputs.version }}\2/' "$MANIFEST" > "$tmp"
+          sed -E 's/("version"[[:space:]]*:[[:space:]]*")[^"]*(")/\1${{ steps.vars.outputs.version }}\2/' "$MANIFEST" > "$tmp"
           mv "$tmp" "$MANIFEST"
           echo "Updated $MANIFEST:"
           grep '"version"' "$MANIFEST"
           # Fail if the bump did not take (e.g. unexpected manifest format).
-          grep -q '"version": "${{ inputs.version }}"' "$MANIFEST"
+          grep -q '"version": "${{ steps.vars.outputs.version }}"' "$MANIFEST"
 
       - name: Commit, tag, and push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$MANIFEST"
-          git commit -m "chore(trace-codex): release v${{ inputs.version }}"
+          git commit -m "chore(trace-codex): release v${{ steps.vars.outputs.version }}"
           git tag "${{ steps.vars.outputs.tag }}"
           git push origin HEAD
           git push origin "${{ steps.vars.outputs.tag }}"

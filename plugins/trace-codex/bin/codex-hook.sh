@@ -58,7 +58,9 @@ if [ -z "$version" ]; then
   exit 0
 fi
 
-url="https://github.com/$REPO/releases/download/trace-codex-v$version/codex-hook-$suffix"
+tag="trace-codex-v$version"
+asset="codex-hook-$suffix"
+url="https://github.com/$REPO/releases/download/$tag/$asset"
 tmp="$BIN.download.$$"
 
 mkdir -p "$ROOT/bin" 2>/dev/null || {
@@ -66,21 +68,78 @@ mkdir -p "$ROOT/bin" 2>/dev/null || {
   exit 0
 }
 
-# Download with curl, falling back to wget. -f makes curl fail on HTTP errors.
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$url" -o "$tmp" 2>/dev/null
-  ok=$?
-elif command -v wget >/dev/null 2>&1; then
-  wget -q "$url" -O "$tmp" 2>/dev/null
-  ok=$?
-else
-  log "neither curl nor wget found; cannot download binary; tracing disabled this session"
-  exit 0
+# The release repo may be private, so the plain browser download URL 404s for
+# unauthenticated callers. Try authenticated paths first (gh CLI, then a token
+# from the environment via the GitHub API), then fall back to an unauthenticated
+# download for the public-repo case. The first method that produces a non-empty
+# file wins. Every method is best-effort and never fails the turn.
+ok=1
+
+# 1) gh CLI: uses the same credentials Codex used to install the plugin, and
+#    transparently handles private repos. `gh release download` writes the asset
+#    to the path given by -O.
+if [ "$ok" -ne 0 ] && command -v gh >/dev/null 2>&1; then
+  if gh release download "$tag" \
+      --repo "$REPO" \
+      --pattern "$asset" \
+      --output "$tmp" \
+      --clobber >/dev/null 2>&1 && [ -s "$tmp" ]; then
+    ok=0
+  else
+    rm -f "$tmp" 2>/dev/null
+  fi
+fi
+
+# 2) Token from the environment + GitHub API. The API asset endpoint with
+#    Accept: application/octet-stream returns the binary (or a redirect curl
+#    follows) for private repos when the token is authorized.
+token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+if [ "$ok" -ne 0 ] && [ -n "$token" ] && command -v curl >/dev/null 2>&1; then
+  api="https://api.github.com/repos/$REPO/releases/tags/$tag"
+  # Resolve the asset id from the release JSON, then download it by id via the
+  # API octet-stream endpoint. The asset's "id" precedes its "name" in the JSON,
+  # so split on commas and track the most recent "id" seen, emitting it when the
+  # matching "name" line appears. Avoids a jq dependency on this path.
+  asset_id=$(curl -fsSL \
+    -H "Authorization: Bearer $token" \
+    -H "Accept: application/vnd.github+json" \
+    "$api" 2>/dev/null \
+    | tr ',' '\n' \
+    | awk -v a="\"$asset\"" '
+        /"id"[[:space:]]*:/ { match($0, /[0-9]+/); id = substr($0, RSTART, RLENGTH) }
+        index($0, "\"name\"") && index($0, a) { print id; exit }
+      ')
+  if [ -n "$asset_id" ]; then
+    curl -fsSL \
+      -H "Authorization: Bearer $token" \
+      -H "Accept: application/octet-stream" \
+      "https://api.github.com/repos/$REPO/releases/assets/$asset_id" \
+      -o "$tmp" 2>/dev/null
+    if [ $? -eq 0 ] && [ -s "$tmp" ]; then
+      ok=0
+    else
+      rm -f "$tmp" 2>/dev/null
+    fi
+  fi
+fi
+
+# 3) Unauthenticated download (works when the repo/releases are public).
+if [ "$ok" -ne 0 ]; then
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp" 2>/dev/null
+    ok=$?
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q "$url" -O "$tmp" 2>/dev/null
+    ok=$?
+  else
+    log "neither curl nor wget found; cannot download binary; tracing disabled this session"
+    exit 0
+  fi
 fi
 
 if [ "$ok" -ne 0 ] || [ ! -s "$tmp" ]; then
   rm -f "$tmp" 2>/dev/null
-  log "failed to download $url; tracing disabled this session"
+  log "failed to download $asset for $tag; tracing disabled this session"
   exit 0
 fi
 
