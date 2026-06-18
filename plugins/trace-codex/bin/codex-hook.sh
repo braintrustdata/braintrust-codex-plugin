@@ -51,8 +51,17 @@ suffix="$os_name-$arch_name"
 
 # Read the plugin version (single source of truth) from the manifest. Only on
 # this slow path, so no dependency (jq) and no parsing on the hot path.
+#
+# TRACE_CODEX_RELEASE_VERSION overrides the manifest version. This is intended
+# for testing (e.g. the smoke test pointing at an arbitrary published release);
+# normal installs leave it unset and use the manifest.
 manifest="$ROOT/.codex-plugin/plugin.json"
-version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)
+version="${TRACE_CODEX_RELEASE_VERSION:-}"
+if [ -z "$version" ]; then
+  version=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$manifest" 2>/dev/null | head -1)
+fi
+# Allow an optional leading 'v' on the override (v0.0.1 or 0.0.1).
+version="${version#v}"
 if [ -z "$version" ]; then
   log "could not read plugin version from $manifest; tracing disabled this session"
   exit 0

@@ -17,7 +17,9 @@ env:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -95,3 +97,13 @@ jobs:
             "$PLUGIN_DIR"/bin/codex-hook-darwin-x64 \
             "$PLUGIN_DIR"/bin/codex-hook-linux-x64 \
             "$PLUGIN_DIR"/bin/codex-hook-linux-arm64
+
+  # After a successful publish, run the end-to-end smoke test (macOS + Linux)
+  # against the just-released version.
+  smoke:
+    needs: release
+    uses: ./.github/workflows/smoke.yaml
+    with:
+      version: ${{ needs.release.outputs.version }}
+    secrets:
+      openai_api_key: ${{ secrets.OPENAI_API_KEY }}

@@ -45,3 +45,17 @@ Advanced plugin settings for debugging or developing the plugin
 | _(none)_              | `BRAINTRUST_EVENT_SERVER_LOG_DIR`                | `$PLUGIN_DATA` | Directory for logs, pidfile, and `config.json`. |
 
 The config file is read by the hook client only at the moment it boots the background server (the running server keeps the config it started with). To pick up config changes, stop the server (or wait for it to idle out) so the next event re-boots it.
+
+## Smoke test
+
+`make smoke` runs a full end-to-end check: it starts a local mock Braintrust collector, runs a real `codex exec "say hi"` session with tracing pointed at the mock, and asserts at least one trace row was reported. This exercises the whole path (Codex hook -> background server -> Braintrust SDK flush) without touching a real Braintrust account.
+
+Requirements: `codex` and `bun` on `PATH`, `OPENAI_API_KEY` set, and the plugin installed in Codex (run `../../install.sh trace-codex` for a local dev install).
+
+```bash
+OPENAI_API_KEY=sk-... make smoke
+# Pin the release whose codex-hook binary the launcher downloads:
+OPENAI_API_KEY=sk-... make smoke SMOKE_VERSION=0.0.1
+```
+
+CI runs the same smoke test (macOS arm64/x64 and Linux) after every release via `.github/workflows/smoke.yaml`. That workflow can also be dispatched manually from the Actions tab against any published release version.
