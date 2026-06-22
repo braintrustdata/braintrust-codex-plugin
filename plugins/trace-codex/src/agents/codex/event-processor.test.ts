@@ -1,108 +1,124 @@
 import { describe, expect, test } from "bun:test";
 import type { ReportingConfig, SpanFactory } from "../../braintrust/logger.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
-import { createTestLogger, withCapturedTrace } from "../../test-helpers.ts";
+import { createTestLogger, spansToTree, withCapturedTrace } from "../../test-helpers.ts";
 import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
 import { CodexEventProcessor } from "./event-processor.ts";
 import {
   assertProducesTrace,
   configEvent,
-  postToolUse,
-  preToolUse,
+  customToolCall,
+  customToolCallOutput,
+  FakeTranscriptReader,
+  functionCall,
+  functionCallOutput,
+  sessionMeta,
   sessionStart,
   stop,
-  userPromptSubmit,
+  taskComplete,
+  taskStarted,
+  transcript,
+  turnContext,
+  userMessage,
 } from "./test-helpers.ts";
+import type {
+  TranscriptReader,
+  TranscriptReadResult,
+  TranscriptWaitResult,
+  WaitForOptions,
+} from "./transcript-reader.ts";
 
-describe("CodexEventProcessor", () => {
-  test("SessionStart produces a root span", async () => {
+// Helpers below build a session as an ordered list of transcript writes and
+// hooks. The final `stop()` hook triggers the catch-up that turns the buffered
+// transcript records into spans (waiting for the task_complete sentinel).
+
+describe("CodexEventProcessor: root span", () => {
+  test("session_meta opens a root span named after the cwd basename", async () => {
     await assertProducesTrace(
-      [sessionStart({ model: "gpt-5.5", cwd: "/work", source: "startup" })],
+      [
+        sessionStart({ source: "startup" }),
+        sessionMeta({ cwd: "/whatever/myapp", id: "session-1" }),
+        turnContext({ model: "gpt-5.5" }),
+        stop({ turn_id: "t1" }),
+      ],
       {
-        span_attributes: { name: "codex: work", type: "task" },
-        input: { model: "gpt-5.5", cwd: "/work", source: "startup" },
-        metadata: { session_id: "session-1", model: "gpt-5.5" },
+        span_attributes: { name: "codex: myapp", type: "task" },
+        metadata: { session_id: "session-1", model: "gpt-5.5", source: "startup" },
         children: [],
       },
     );
   });
 
-  test("root span is named after the project directory (basename of cwd)", async () => {
-    await assertProducesTrace([sessionStart({ cwd: "/whatever/myapp" })], {
-      span_attributes: { name: "codex: myapp", type: "task" },
-      children: [],
-    });
-  });
-
   test("root span name handles a trailing slash in cwd", async () => {
-    await assertProducesTrace([sessionStart({ cwd: "/whatever/myapp/" })], {
-      span_attributes: { name: "codex: myapp", type: "task" },
-      children: [],
-    });
+    await assertProducesTrace(
+      [sessionStart(), sessionMeta({ cwd: "/whatever/myapp/" }), stop({ turn_id: "t1" })],
+      { span_attributes: { name: "codex: myapp", type: "task" }, children: [] },
+    );
   });
 
   test("root span falls back to 'codex session' when cwd is missing", async () => {
-    await assertProducesTrace([sessionStart({})], {
+    await assertProducesTrace([sessionStart(), sessionMeta({}), stop({ turn_id: "t1" })], {
       span_attributes: { name: "codex session", type: "task" },
       children: [],
     });
   });
 
-  test("a session with no Stop stays active (no end time)", async () => {
+  test("model is backfilled from turn_context", async () => {
     await assertProducesTrace(
-      [sessionStart({ model: "gpt-5.5", source: "startup" }), userPromptSubmit({ prompt: "hi" })],
+      [sessionStart(), sessionMeta({ cwd: "/work" }), turnContext({ model: "gpt-5.5" }), stop({})],
       {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: false,
+        span_attributes: { name: "codex: work", type: "task" },
+        metadata: { model: "gpt-5.5" },
         children: [],
       },
+    );
+  });
+
+  test("root carries source and permission_mode from the SessionStart hook", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart({ source: "resume", permission_mode: "acceptEdits" }),
+        sessionMeta({ cwd: "/work" }),
+        stop({}),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        metadata: { source: "resume", permission_mode: "acceptEdits" },
+        children: [],
+      },
+    );
+  });
+
+  test("duplicate session_meta still yields a single root span", async () => {
+    await assertProducesTrace(
+      [sessionStart(), sessionMeta({ cwd: "/work" }), sessionMeta({ cwd: "/work" }), stop({})],
+      { span_attributes: { name: "codex: work", type: "task" }, children: [] },
     );
   });
 
   test("Stop ends the root span", async () => {
-    await assertProducesTrace(
-      [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "hi" }),
-        stop({}),
-      ],
-      {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: true,
-        children: [],
-      },
-    );
+    await assertProducesTrace([sessionStart(), sessionMeta({ cwd: "/work" }), stop({})], {
+      span_attributes: { name: "codex: work", type: "task" },
+      ended: true,
+      children: [],
+    });
   });
+});
 
-  test("ends on the first Stop; later events do not reopen it", async () => {
+describe("CodexEventProcessor: turn spans", () => {
+  test("task_started/task_complete become a turn span with prompt input and assistant output", async () => {
     await assertProducesTrace(
       [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "hi", turn_id: "t1" }),
-        stop({ turn_id: "t1", last_assistant_message: "hello" }),
-        userPromptSubmit({ prompt: "another thing", turn_id: "t2" }),
-        stop({ turn_id: "t2", last_assistant_message: "ok" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "what's your name?" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "I'm Codex." }),
+        stop({ turn_id: "t1" }),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: true,
-        children: [
-          { span_attributes: { name: "turn: t1", type: "task" } },
-          { span_attributes: { name: "turn: t2", type: "task" } },
-        ],
-      },
-    );
-  });
-
-  test("a turn becomes a child span with prompt input and assistant output", async () => {
-    await assertProducesTrace(
-      [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "what's your name?", turn_id: "t1" }),
-        stop({ turn_id: "t1", last_assistant_message: "I'm Codex." }),
-      ],
-      {
-        span_attributes: { name: "codex session", type: "task" },
+        span_attributes: { name: "codex: work", type: "task" },
         ended: true,
         children: [
           {
@@ -111,61 +127,352 @@ describe("CodexEventProcessor", () => {
             output: "I'm Codex.",
             metadata: { turn_id: "t1" },
             ended: true,
+            children: [],
           },
         ],
       },
     );
   });
 
-  test("an open turn with no matching Stop stays active", async () => {
+  test("two turns become two ordered child spans", async () => {
     await assertProducesTrace(
       [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "hi", turn_id: "t1" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "one" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "first" }),
+        taskStarted({ turn_id: "t2" }),
+        userMessage({ message: "two" }),
+        taskComplete({ turn_id: "t2", last_agent_message: "second" }),
+        stop({ turn_id: "t2" }),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: false,
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          { span_attributes: { name: "turn: t1", type: "task" }, output: "first", ended: true },
+          { span_attributes: { name: "turn: t2", type: "task" }, output: "second", ended: true },
+        ],
+      },
+    );
+  });
+
+  test("a turn whose task_complete lands after its Stop is closed by the final flush catch-up", async () => {
+    // Regression: the last turn's task_complete can be written just after its
+    // Stop hook fires, so the Stop's bounded wait misses it. The final flush
+    // read must still pick it up and close the turn. Here task_complete is
+    // ordered AFTER stop() in the list (so it is only present at flush time).
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "one" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "first" }),
+        stop({ turn_id: "t1" }),
+        taskStarted({ turn_id: "t2" }),
+        userMessage({ message: "two" }),
+        // Tool call/output present at Stop time, but task_complete is not yet.
+        functionCall({ turn_id: "t2", name: "exec_command", call_id: "c2" }),
+        functionCallOutput({ call_id: "c2", output: "ok" }),
+        stop({ turn_id: "t2" }),
+        // task_complete written after the Stop — only seen by the flush catch-up.
+        taskComplete({ turn_id: "t2", last_agent_message: "second" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          { span_attributes: { name: "turn: t1", type: "task" }, output: "first", ended: true },
+          {
+            span_attributes: { name: "turn: t2", type: "task" },
+            output: "second",
+            ended: true,
+            children: [{ span_attributes: { name: "exec_command", type: "tool" }, ended: true }],
+          },
+        ],
+      },
+    );
+  });
+
+  test("each turn closes when its own Stop arrives (per-turn Stops)", async () => {
+    // Mirrors real Codex: Stop fires per turn. Turn 1 is processed/closed on its
+    // own Stop; turn 2 opens after and closes on the second Stop. Regression for
+    // the bug where the second turn never closed.
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "one" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "first" }),
+        stop({ turn_id: "t1" }),
+        taskStarted({ turn_id: "t2" }),
+        userMessage({ message: "two" }),
+        taskComplete({ turn_id: "t2", last_agent_message: "second" }),
+        stop({ turn_id: "t2" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          { span_attributes: { name: "turn: t1", type: "task" }, output: "first", ended: true },
+          { span_attributes: { name: "turn: t2", type: "task" }, output: "second", ended: true },
+        ],
+      },
+    );
+  });
+
+  test("a turn still open when the root ends is closed by the root-end backstop", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "hi" }),
+        // No task_complete; the Stop hook ends the root and closes the turn.
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          { span_attributes: { name: "turn: t1", type: "task" }, input: "hi", ended: true },
+        ],
+      },
+    );
+  });
+});
+
+describe("CodexEventProcessor: span timing (from transcript timestamps)", () => {
+  // 2026-01-01T00:00:10Z = 1767225610, :12Z = 1767225612, :15Z = 1767225615.
+  test("turn and tool spans get start/end from their transcript record timestamps", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        transcript({
+          type: "session_meta",
+          timestamp: "2026-01-01T00:00:10Z",
+          payload: { cwd: "/work", id: "session-1" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:11Z",
+          payload: { type: "task_started", turn_id: "t1" },
+        }),
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:12Z",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            call_id: "c1",
+            metadata: { turn_id: "t1" },
+          },
+        }),
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:13Z",
+          payload: { type: "function_call_output", call_id: "c1", output: "ok" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:15Z",
+          payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" },
+        }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        // Root ends on first Stop at the turn's completion time.
+        metrics: { start: 1767225610, end: 1767225615 },
         children: [
           {
             span_attributes: { name: "turn: t1", type: "task" },
-            input: "hi",
-            ended: false,
+            metrics: { start: 1767225611, end: 1767225615 },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "exec_command", type: "tool" },
+                metrics: { start: 1767225612, end: 1767225613 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+});
+
+describe("CodexEventProcessor: tool spans", () => {
+  test("a function_call/output pair becomes a tool span under its turn", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "run it" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "call_1",
+          arguments: '{"cmd":"ls"}',
+        }),
+        functionCallOutput({ call_id: "call_1", output: "file.txt" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            output: "done",
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "exec_command", type: "tool" },
+                input: '{"cmd":"ls"}',
+                output: "file.txt",
+                metadata: { tool_name: "exec_command", call_id: "call_1", turn_id: "t1" },
+                ended: true,
+                children: [],
+              },
+            ],
           },
         ],
       },
     );
   });
 
-  test("a Stop with no matching turn does not create a turn span", async () => {
+  test("custom_tool_call (apply_patch) becomes a tool span using the raw name", async () => {
     await assertProducesTrace(
       [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        stop({ turn_id: "nope", last_assistant_message: "orphan" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        customToolCall({
+          turn_id: "t1",
+          name: "apply_patch",
+          call_id: "call_2",
+          input: "*** Begin Patch",
+        }),
+        customToolCallOutput({ call_id: "call_2", output: "Success" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "ok" }),
+        stop({ turn_id: "t1" }),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
+        span_attributes: { name: "codex: work", type: "task" },
         ended: true,
-        children: [],
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "apply_patch", type: "tool" },
+                input: "*** Begin Patch",
+                output: "Success",
+                ended: true,
+              },
+            ],
+          },
+        ],
       },
     );
   });
 
-  test("duplicate SessionStart still yields a single root span", async () => {
+  test("multiple tool calls in one turn become ordered sibling tool spans", async () => {
     await assertProducesTrace(
       [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({ turn_id: "t1", name: "exec_command", call_id: "c1" }),
+        functionCallOutput({ call_id: "c1", output: "a" }),
+        customToolCall({ turn_id: "t1", name: "apply_patch", call_id: "c2" }),
+        customToolCallOutput({ call_id: "c2", output: "b" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
-        children: [],
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              { span_attributes: { name: "exec_command", type: "tool" }, output: "a", ended: true },
+              { span_attributes: { name: "apply_patch", type: "tool" }, output: "b", ended: true },
+            ],
+          },
+        ],
       },
     );
   });
 
-  test("a config event builds the per-session factory with its config", () => {
-    // Spy provider records the config it was asked to build a factory for.
+  test("an unpaired tool call (no output) is closed when its turn ends", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({ turn_id: "t1", name: "exec_command", call_id: "c1", arguments: "{}" }),
+        // No output for c1; the turn completes anyway.
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "exec_command", type: "tool" },
+                input: "{}",
+                ended: true,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("a tool call with no matching open turn span is skipped", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        // turn_id "tX" was never opened; the tool span must be skipped.
+        functionCall({ turn_id: "tX", name: "exec_command", call_id: "c1" }),
+        functionCallOutput({ call_id: "c1", output: "x" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          { span_attributes: { name: "turn: t1", type: "task" }, ended: true, children: [] },
+        ],
+      },
+    );
+  });
+});
+
+describe("CodexEventProcessor: config / master switch", () => {
+  test("a config event builds the per-session factory with its config", async () => {
     let seen: ReportingConfig | undefined;
     const fake: SpanFactory = {
       startSpan: () =>
@@ -179,7 +486,8 @@ describe("CodexEventProcessor", () => {
       return fake;
     };
 
-    const processor = new CodexEventProcessor("sess-1", createTestLogger(), provider);
+    const reader = new FakeTranscriptReader();
+    const processor = new CodexEventProcessor("sess-1", createTestLogger(), provider, reader);
     const cfg: EnqueueEvent = {
       queueId: "sess-1",
       eventSource: "codex-hook",
@@ -192,9 +500,16 @@ describe("CodexEventProcessor", () => {
         traceToBraintrust: true,
       },
     };
-    processor.process(cfg);
-    // Factory is built lazily on first span (the SessionStart).
-    processor.process(sessionStart({ session_id: "sess-1", model: "gpt-5.5" }));
+    await processor.process(cfg);
+    // Factory is built lazily on first span (session_meta).
+    reader.append(
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:00Z",
+        type: "session_meta",
+        payload: { id: "sess-1", cwd: "/work" },
+      }),
+    );
+    await processor.process(sessionStart({ session_id: "sess-1" }));
 
     expect(seen).toEqual({
       project: "team-project",
@@ -208,9 +523,14 @@ describe("CodexEventProcessor", () => {
 
   test("root span metadata carries the configured project", async () => {
     await assertProducesTrace(
-      [configEvent({ project: "team-project" }), sessionStart({ model: "gpt-5.5" })],
+      [
+        configEvent({ project: "team-project" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        stop({}),
+      ],
       {
-        span_attributes: { name: "codex session", type: "task" },
+        span_attributes: { name: "codex: work", type: "task" },
         metadata: { project: "team-project" },
         children: [],
       },
@@ -218,20 +538,32 @@ describe("CodexEventProcessor", () => {
   });
 
   test("when tracing is disabled, no spans are produced", async () => {
+    const reader = new FakeTranscriptReader();
     const trace = withCapturedTrace();
     try {
-      const processor = new CodexEventProcessor("s", createTestLogger(), () => trace.spanFactory);
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
       // Config event WITHOUT traceToBraintrust (defaults off).
-      processor.process({
+      await processor.process({
         queueId: "s",
         eventSource: "codex-hook",
         eventSourceVersion: null,
         eventName: CODEX_CONFIG_EVENT,
         eventData: { project: "p" },
       });
-      processor.process(sessionStart({ session_id: "s" }));
-      processor.process(userPromptSubmit({ session_id: "s", turn_id: "t1", prompt: "hi" }));
-      processor.process(stop({ session_id: "s", turn_id: "t1", last_assistant_message: "yo" }));
+      reader.append(
+        JSON.stringify({
+          timestamp: "2026-01-01T00:00:00Z",
+          type: "session_meta",
+          payload: { id: "s", cwd: "/work" },
+        }),
+      );
+      await processor.process(sessionStart({ session_id: "s" }));
+      await processor.process(stop({ session_id: "s", turn_id: "t1" }));
       await processor.flush();
 
       const spans = await trace.drain();
@@ -248,150 +580,166 @@ describe("CodexEventProcessor", () => {
           project: "team-project",
           additionalMetadata: { team: "platform", model: "SHOULD_BE_OVERRIDDEN" },
         }),
-        sessionStart({ model: "gpt-5.5" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        stop({}),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
-        // team comes from additionalMetadata; model is the standard key (wins).
+        span_attributes: { name: "codex: work", type: "task" },
         metadata: { team: "platform", model: "gpt-5.5", project: "team-project" },
         children: [],
       },
     );
   });
+});
 
-  test("a paired tool call becomes a 'tool' span under its turn", async () => {
+describe("CodexEventProcessor: transcript catch-up plumbing", () => {
+  test("each hook reads from the advancing offset (each line read once)", async () => {
+    const reader = new FakeTranscriptReader();
     await assertProducesTrace(
       [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
-        preToolUse({
-          turn_id: "t1",
-          tool_name: "Bash",
-          tool_use_id: "call_1",
-          tool_input: { command: "ls" },
-        }),
-        postToolUse({
-          turn_id: "t1",
-          tool_name: "Bash",
-          tool_use_id: "call_1",
-          tool_response: "file.txt",
-        }),
-        stop({ turn_id: "t1", last_assistant_message: "done" }),
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "hi" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "yo" }),
+        stop({ turn_id: "t1" }),
       ],
       {
-        span_attributes: { name: "codex session", type: "task" },
+        span_attributes: { name: "codex: work", type: "task" },
         ended: true,
-        children: [
-          {
-            span_attributes: { name: "turn: t1", type: "task" },
-            input: "run it",
-            output: "done",
-            ended: true,
-            children: [
-              {
-                span_attributes: { name: "Bash", type: "tool" },
-                input: { command: "ls" },
-                output: "file.txt",
-                metadata: { tool_name: "Bash", tool_use_id: "call_1", turn_id: "t1" },
-                ended: true,
-                children: [],
-              },
-            ],
-          },
-        ],
+        children: [{ span_attributes: { name: "turn: t1", type: "task" }, ended: true }],
       },
+      { reader },
+    );
+
+    // Reads: SessionStart (readFrom), Stop (waitFor). The injected config event
+    // has no transcript_path, so it does not read.
+    expect(reader.readOffsets.length).toBeGreaterThanOrEqual(2);
+    for (let i = 1; i < reader.readOffsets.length; i++) {
+      expect(reader.readOffsets[i]).toBeGreaterThanOrEqual(reader.readOffsets[i - 1] as number);
+    }
+    expect(reader.readOffsets[0]).toBe(0);
+  });
+
+  test("a malformed transcript line is skipped without breaking handling", async () => {
+    const reader = new FakeTranscriptReader();
+    reader.append("this is not valid json");
+    await assertProducesTrace(
+      [sessionStart(), sessionMeta({ cwd: "/work" }), stop({ turn_id: "t1" })],
+      { span_attributes: { name: "codex: work", type: "task" }, ended: true, children: [] },
+      { reader },
     );
   });
 
-  test("multiple tool calls in one turn become sibling tool spans", async () => {
-    await assertProducesTrace(
-      [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "do two things", turn_id: "t1" }),
-        preToolUse({ turn_id: "t1", tool_name: "Bash", tool_use_id: "call_1" }),
-        postToolUse({ turn_id: "t1", tool_use_id: "call_1", tool_response: "a" }),
-        preToolUse({ turn_id: "t1", tool_name: "apply_patch", tool_use_id: "call_2" }),
-        postToolUse({ turn_id: "t1", tool_use_id: "call_2", tool_response: "b" }),
-        stop({ turn_id: "t1", last_assistant_message: "done" }),
-      ],
-      {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: true,
-        children: [
-          {
-            span_attributes: { name: "turn: t1", type: "task" },
-            ended: true,
-            children: [
-              { span_attributes: { name: "Bash", type: "tool" }, output: "a", ended: true },
-              {
-                span_attributes: { name: "apply_patch", type: "tool" },
-                output: "b",
-                ended: true,
-              },
-            ],
-          },
-        ],
-      },
-    );
-  });
+  test("flush polls the transcript until an open turn's task_complete appears", async () => {
+    // A reader that withholds its last appended line until a later read, modeling
+    // a task_complete that lands after the terminal Stop. flush() must poll until
+    // it appears and then close the turn.
+    class DelayedRevealReader implements TranscriptReader {
+      private lines: string[] = [];
+      private withheld: string | null = null;
+      private readsUntilReveal = 0;
 
-  test("an unpaired PreToolUse (no PostToolUse) is closed when its turn ends", async () => {
-    await assertProducesTrace(
-      [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
-        preToolUse({
-          turn_id: "t1",
-          tool_name: "Bash",
-          tool_use_id: "call_1",
-          tool_input: { command: "ls" },
-        }),
-        // No PostToolUse for call_1 (e.g. interrupted), then the turn stops.
-        stop({ turn_id: "t1", last_assistant_message: "done" }),
-      ],
-      {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: true,
-        children: [
-          {
-            span_attributes: { name: "turn: t1", type: "task" },
-            ended: true,
-            children: [
-              {
-                span_attributes: { name: "Bash", type: "tool" },
-                input: { command: "ls" },
-                // No output (PostToolUse never arrived), but the span is ended.
-                ended: true,
-                children: [],
-              },
-            ],
-          },
-        ],
-      },
-    );
-  });
+      append(line: string): void {
+        this.lines.push(line);
+      }
 
-  test("a tool call with no matching open turn span is skipped", async () => {
-    await assertProducesTrace(
-      [
-        sessionStart({ model: "gpt-5.5", source: "startup" }),
-        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
-        // turn_id "tX" was never opened; the tool span must be skipped.
-        preToolUse({ turn_id: "tX", tool_name: "Bash", tool_use_id: "call_1" }),
-        postToolUse({ turn_id: "tX", tool_use_id: "call_1", tool_response: "x" }),
-        stop({ turn_id: "t1", last_assistant_message: "done" }),
-      ],
-      {
-        span_attributes: { name: "codex session", type: "task" },
-        ended: true,
-        children: [
-          {
-            span_attributes: { name: "turn: t1", type: "task" },
-            ended: true,
-            children: [],
-          },
-        ],
-      },
+      /** Append a line that only becomes visible after `afterReads` more reads. */
+      withhold(line: string, afterReads: number): void {
+        this.withheld = line;
+        this.readsUntilReveal = afterReads;
+      }
+
+      private visible(): string[] {
+        return this.lines;
+      }
+
+      readFrom(_path: string, offset: number): TranscriptReadResult {
+        // Reveal the withheld line once enough reads have happened.
+        if (this.withheld !== null) {
+          if (this.readsUntilReveal <= 0) {
+            this.lines.push(this.withheld);
+            this.withheld = null;
+          } else {
+            this.readsUntilReveal -= 1;
+          }
+        }
+        const visible = this.visible();
+        const buf = visible.length > 0 ? `${visible.join("\n")}\n` : "";
+        const from = offset > buf.length ? 0 : offset;
+        const slice = buf.slice(from);
+        const out: string[] = [];
+        let consumed = 0;
+        let lineStart = 0;
+        for (let i = 0; i < slice.length; i++) {
+          if (slice[i] === "\n") {
+            out.push(slice.slice(lineStart, i));
+            lineStart = i + 1;
+            consumed = lineStart;
+          }
+        }
+        return { lines: out, offset: from + consumed };
+      }
+
+      async waitFor(
+        path: string,
+        offset: number,
+        predicate: (line: string) => boolean,
+        _opts: WaitForOptions,
+      ): Promise<TranscriptWaitResult> {
+        const { lines, offset: next } = this.readFrom(path, offset);
+        return { lines, offset: next, sentinelFound: lines.some(predicate) };
+      }
+    }
+
+    const reader = new DelayedRevealReader();
+    reader.append(
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:10Z",
+        type: "session_meta",
+        payload: { id: "s", cwd: "/work" },
+      }),
     );
+    reader.append(
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:11Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "t1" },
+      }),
+    );
+    // task_complete is withheld: not visible at the Stop's waitFor, appears later.
+    reader.withhold(
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:15Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" },
+      }),
+      1,
+    );
+
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+      await processor.process(configEvent({ session_id: "s" }));
+      await processor.process(sessionStart({ session_id: "s" }));
+      // Stop's bounded wait won't see task_complete yet; turn stays open.
+      await processor.process(stop({ session_id: "s", turn_id: "t1" }));
+      // flush polls until the withheld task_complete is revealed and closes t1.
+      await processor.flush();
+
+      const tree = spansToTree(await trace.drain());
+      const turn = tree?.children[0];
+      expect(turn?.name).toBe("turn: t1");
+      expect(turn?.metrics?.end).toBe(1767225615); // 2026-01-01T00:00:15Z
+    } finally {
+      trace.cleanup();
+    }
   });
 });

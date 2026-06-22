@@ -190,6 +190,8 @@ export interface ExpectedSpan {
   metadata?: Record<string, unknown>;
   /** If set, assert whether the span has an end time (true) or not (false). */
   ended?: boolean;
+  /** If set, assert exact start/end metric values (Unix seconds). */
+  metrics?: { start?: number; end?: number };
   /** Exact list of children (length and order are checked). */
   children?: ExpectedSpan[];
 }
@@ -242,6 +244,18 @@ export function diffSpan(actual: SpanTree | null, expected: ExpectedSpan, path: 
     const isEnded = actual.metrics?.end !== undefined;
     if (isEnded !== expected.ended) {
       diffs.push(`${path}.ended: expected ${expected.ended}, got ${isEnded}`);
+    }
+  }
+  if (expected.metrics !== undefined) {
+    if (expected.metrics.start !== undefined && actual.metrics?.start !== expected.metrics.start) {
+      diffs.push(
+        `${path}.metrics.start: expected ${expected.metrics.start}, got ${String(actual.metrics?.start)}`,
+      );
+    }
+    if (expected.metrics.end !== undefined && actual.metrics?.end !== expected.metrics.end) {
+      diffs.push(
+        `${path}.metrics.end: expected ${expected.metrics.end}, got ${String(actual.metrics?.end)}`,
+      );
     }
   }
   if (expected.children !== undefined) {
