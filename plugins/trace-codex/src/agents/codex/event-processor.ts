@@ -30,11 +30,23 @@ import {
   type Span,
   type SpanFactory,
   type SpanFactoryProvider,
+  type SpanRef,
+  spanRef,
 } from "../../braintrust/logger.ts";
 import type { Logger } from "../../log.ts";
 import type { EventProcessor } from "../../processor/event-processor.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
+import { PLUGIN_VERSION } from "../../version.ts";
 import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
+import type { SnapshotStore } from "./snapshot-store.ts";
+import {
+  type CodexSnapshot,
+  type ConversationItemSnapshot,
+  isCompatibleSnapshot,
+  redactReportingConfig,
+  type ScopeSnapshot,
+  SNAPSHOT_SCHEMA_VERSION,
+} from "./state-snapshot.ts";
 import {
   EVT_TASK_COMPLETE,
   EVT_TASK_STARTED,
@@ -362,6 +374,17 @@ function permissionInfo(args: unknown): PermissionInfo | undefined {
   return info;
 }
 
+// ConversationItems (chat messages / reasoning) are already plain JSON, so they
+// round-trip through a snapshot unchanged. These two helpers just bridge the
+// nominal type boundary between the live union and the snapshot's record array
+// (via unknown) without copying.
+function toItemSnapshots(items: ConversationItem[]): ConversationItemSnapshot[] {
+  return items as unknown as ConversationItemSnapshot[];
+}
+function fromItemSnapshots(items: ConversationItemSnapshot[]): ConversationItem[] {
+  return items as unknown as ConversationItem[];
+}
+
 export class CodexEventProcessor implements EventProcessor {
   private readonly logger: Logger;
   private readonly queueId: string | null;
@@ -405,17 +428,33 @@ export class CodexEventProcessor implements EventProcessor {
   // turn_id -> the compaction span built from the transcript, kept so a later
   // PreCompact/PostCompact hook can back-fill the trigger onto it.
   private readonly compactionSpansByTurn = new Map<string, Span>();
+  // span_id -> the name/type the span was created (or renamed) with. The SDK
+  // doesn't expose these as getters, but a rehydrated span must re-assert them
+  // (else the SDK infers a wrong name from the call stack on resume), so we
+  // remember them here and feed them into each SpanRef at serialize time.
+  private readonly spanAttrs = new Map<string, { name: string; type: SpanRef["type"] }>();
+  // Optional per-session state store. When present, the processor persists a
+  // snapshot of its resumable state on flush and, on its first event, rehydrates
+  // any snapshot left by a previous server run for this session (so a session
+  // that outlived the server — idle shutdown or explicit close+resume — keeps
+  // building the same trace instead of starting over). Null disables resume.
+  private readonly snapshotStore: SnapshotStore | null;
+  // Whether we've already attempted a one-time restore from the store. Restore
+  // runs lazily on the first non-config event, once the span factory exists.
+  private restoreAttempted = false;
 
   constructor(
     queueId: string | null,
     logger: Logger,
     spanFactoryProvider: SpanFactoryProvider = defaultSpanFactoryProvider,
     transcriptReader: TranscriptReader = defaultTranscriptReader,
+    snapshotStore: SnapshotStore | null = null,
   ) {
     this.queueId = queueId;
     this.logger = logger;
     this.spanFactoryProvider = spanFactoryProvider;
     this.transcriptReader = transcriptReader;
+    this.snapshotStore = snapshotStore;
   }
 
   /** The session's SpanFactory, built from the config event on first use. */
@@ -441,6 +480,17 @@ export class CodexEventProcessor implements EventProcessor {
       this.configure(event);
       return;
     }
+
+    // First real event for this session: if a previous server run left a
+    // snapshot (idle shutdown mid-session, or an explicit close+resume), rebuild
+    // our state from it before processing. Runs once, regardless of which hook
+    // arrives first — the very next hook after a restart may not be SessionStart,
+    // and may not be preceded by a config event. Restore brings back the
+    // session's reporting config, so it MUST run before the master-switch check
+    // below (otherwise a resumed session with no leading config event would look
+    // untraced and we'd drop its events).
+    this.ensureRestored();
+
     // Master switch: when tracing is disabled, drop everything (no SDK calls).
     if (!this.tracingEnabled) {
       this.logger.debug("codex processor: tracing disabled; dropping event", {
@@ -719,19 +769,24 @@ export class CodexEventProcessor implements EventProcessor {
     if (pending === undefined || scope.subagentRootSpan !== null) return;
     const startTime = isoToUnixSeconds(record.timestamp);
     try {
-      scope.subagentRootSpan = pending.parent.startSpan({
-        name: `subagent: ${pending.agentId}`,
-        type: "task",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: {
-          metadata: {
-            agent_id: pending.agentId,
-            agent_type: pending.agentType,
-            // The subagent's own rollout transcript on disk.
-            transcript_path: scope.path,
+      const subagentName = `subagent: ${pending.agentId}`;
+      scope.subagentRootSpan = this.trackSpan(
+        pending.parent.startSpan({
+          name: subagentName,
+          type: "task",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: {
+            metadata: {
+              agent_id: pending.agentId,
+              agent_type: pending.agentType,
+              // The subagent's own rollout transcript on disk.
+              transcript_path: scope.path,
+            },
           },
-        },
-      });
+        }),
+        subagentName,
+        "task",
+      );
       this.logger.info("codex processor: opened subagent root span", {
         queueId: this.queueId,
         agentId: pending.agentId,
@@ -914,7 +969,10 @@ export class CodexEventProcessor implements EventProcessor {
     if (this.rootSpan !== null) {
       try {
         this.rootSpan.log({
-          metadata: { source: this.rootEnrichment.source, permission_mode: permissionMode },
+          metadata: {
+            source: this.rootEnrichment.source,
+            permission_mode: this.rootEnrichment.permissionMode,
+          },
         });
       } catch (err) {
         this.logger.error("codex processor: failed to enrich root span", {
@@ -945,27 +1003,32 @@ export class CodexEventProcessor implements EventProcessor {
     const spanName = projectDir ? `codex: ${projectDir}` : "codex session";
 
     try {
-      this.rootSpan = this.spanFactory.startSpan({
-        name: spanName,
-        type: "task",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: {
-          input: { model: this.mainScope?.model, cwd, source: this.rootEnrichment.source },
-          metadata: {
-            // User-provided extras first, so the standard keys below win.
-            ...this.reportingConfig?.additionalMetadata,
-            session_id: sessionId,
-            model: this.mainScope?.model,
-            cwd,
-            source: this.rootEnrichment.source,
-            permission_mode: this.rootEnrichment.permissionMode,
-            cli_version: typeof payload.cli_version === "string" ? payload.cli_version : undefined,
-            project: this.reportingConfig?.project,
-            // The session's rollout transcript on disk (the source for this trace).
-            transcript_path: this.mainScope?.path,
+      this.rootSpan = this.trackSpan(
+        this.spanFactory.startSpan({
+          name: spanName,
+          type: "task",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: {
+            input: { model: this.mainScope?.model, cwd, source: this.rootEnrichment.source },
+            metadata: {
+              // User-provided extras first, so the standard keys below win.
+              ...this.reportingConfig?.additionalMetadata,
+              session_id: sessionId,
+              model: this.mainScope?.model,
+              cwd,
+              source: this.rootEnrichment.source,
+              permission_mode: this.rootEnrichment.permissionMode,
+              cli_version:
+                typeof payload.cli_version === "string" ? payload.cli_version : undefined,
+              project: this.reportingConfig?.project,
+              // The session's rollout transcript on disk (the source for this trace).
+              transcript_path: this.mainScope?.path,
+            },
           },
-        },
-      });
+        }),
+        spanName,
+        "task",
+      );
       this.logger.info("codex processor: opened root span", {
         queueId: this.queueId,
         spanId: this.rootSpan.id,
@@ -1023,13 +1086,18 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
     const startTime = isoToUnixSeconds(record.timestamp);
+    const turnName = `turn: ${turnId}`;
     try {
-      const turnSpan = parent.startSpan({
-        name: `turn: ${turnId}`,
-        type: "task",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: { metadata: { turn_id: turnId, model: scope.model } },
-      });
+      const turnSpan = this.trackSpan(
+        parent.startSpan({
+          name: turnName,
+          type: "task",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: { metadata: { turn_id: turnId, model: scope.model } },
+        }),
+        turnName,
+        "task",
+      );
       scope.openTurns.set(turnId, turnSpan);
       this.logger.info("codex processor: opened turn span", {
         queueId: this.queueId,
@@ -1072,6 +1140,9 @@ export class CodexEventProcessor implements EventProcessor {
     this.compactionSpansByTurn.set(turnId, turnSpan);
     try {
       turnSpan.setAttributes({ name: "compaction", type: "task" });
+      // Remember the rename so a resumed snapshot re-asserts "compaction", not
+      // the original "turn: ..." name.
+      this.spanAttrs.set(turnSpan.spanId, { name: "compaction", type: "task" });
       turnSpan.log({
         metadata: {
           compaction: {
@@ -1101,17 +1172,22 @@ export class CodexEventProcessor implements EventProcessor {
     const startTime = isoToUnixSeconds(record.timestamp);
     const before = scope.conversationHistory.map((item) => ({ ...item }));
     const output = compactionOutput(replacement);
+    const compactionLlmName = scope.model ?? "compaction";
     try {
-      const span = turnSpan.startSpan({
-        name: scope.model ?? "compaction",
-        type: "llm",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: {
-          input: { messages_before_compaction: before.length, history: before },
-          output,
-          metadata: { model: scope.model, turn_id: turnId, compaction: true },
-        },
-      });
+      const span = this.trackSpan(
+        turnSpan.startSpan({
+          name: compactionLlmName,
+          type: "llm",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: {
+            input: { messages_before_compaction: before.length, history: before },
+            output,
+            metadata: { model: scope.model, turn_id: turnId, compaction: true },
+          },
+        }),
+        compactionLlmName,
+        "llm",
+      );
       // Reuse the open-llm slot so the turn's token_count closes it with usage.
       // outputPreset: the replacement history is already logged as the output, so
       // the closing token_count must not overwrite it.
@@ -1241,13 +1317,18 @@ export class CodexEventProcessor implements EventProcessor {
     // Snapshot the conversation as this call's input (the transcript doesn't log
     // the real request, so this is a best-effort reconstruction).
     const input = scope.conversationHistory.map((item) => ({ ...item }));
+    const llmName = scope.model ?? "llm";
     try {
-      const span = turnSpan.startSpan({
-        name: scope.model ?? "llm",
-        type: "llm",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: { input, metadata: { model: scope.model, turn_id: turnId } },
-      });
+      const span = this.trackSpan(
+        turnSpan.startSpan({
+          name: llmName,
+          type: "llm",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: { input, metadata: { model: scope.model, turn_id: turnId } },
+        }),
+        llmName,
+        "llm",
+      );
       scope.openLlm = { span, turnId, output: [] };
       this.logger.info("codex processor: opened llm span", {
         queueId: this.queueId,
@@ -1413,17 +1494,22 @@ export class CodexEventProcessor implements EventProcessor {
     // inline in the arguments), surface it on the span as metadata and a tag.
     const permission = permissionInfo(input);
     const startTime = isoToUnixSeconds(record.timestamp);
+    const toolName = name ?? "tool";
     try {
-      const toolSpan = turnSpan.startSpan({
-        name: name ?? "tool",
-        type: "tool",
-        ...(startTime !== undefined ? { startTime } : {}),
-        event: {
-          input,
-          metadata: { tool_name: name, call_id: callId, turn_id: turnId, permission },
-          ...(permission !== undefined ? { tags: [PERMISSION_TAG] } : {}),
-        },
-      });
+      const toolSpan = this.trackSpan(
+        turnSpan.startSpan({
+          name: toolName,
+          type: "tool",
+          ...(startTime !== undefined ? { startTime } : {}),
+          event: {
+            input,
+            metadata: { tool_name: name, call_id: callId, turn_id: turnId, permission },
+            ...(permission !== undefined ? { tags: [PERMISSION_TAG] } : {}),
+          },
+        }),
+        toolName,
+        "tool",
+      );
       scope.openTools.set(callId, { span: toolSpan, turnId });
       // Remember the TURN span that ran a spawn_agent tool (main scope only) so a
       // subagent's root span can be parented as a sibling of the tool (both under
@@ -1597,6 +1683,11 @@ export class CodexEventProcessor implements EventProcessor {
         error: String(err),
       });
     }
+    // NOTE: we deliberately do NOT delete the snapshot here. Ending the root span
+    // means "this turn's Stop fired", not "the session is over" — Codex has no
+    // session-end hook, and later turns attach as children of this same root. The
+    // snapshot must persist so a restart between turns can resume the session;
+    // stale ones are reclaimed by the store's age-based GC.
   }
 
   async flush(): Promise<void> {
@@ -1617,6 +1708,256 @@ export class CodexEventProcessor implements EventProcessor {
         queueId: this.queueId,
         error: String(err),
       });
+    }
+    // Persist state so a future server run can resume this session's trace. Done
+    // after the catch-up + flush above so the snapshot reflects the latest
+    // offsets and closed spans.
+    this.persistState();
+  }
+
+  // ==========================================================================
+  // State persistence (resume support)
+  // ==========================================================================
+
+  // Persist this session's snapshot so a future server run can resume the trace.
+  // Best-effort: the store never throws. No-op without a store/session id, or
+  // before any root span exists (nothing worth resuming yet).
+  //
+  // We persist even once the root span has ended. Codex's "Stop" is per-TURN,
+  // not per-session (there is no session-end hook), and we end the root on the
+  // first Stop — but the session lives on and more turns can follow, each a
+  // child of that same (ended) root. So the snapshot must survive past root-end,
+  // or a server restart between turns would lose the thread and start a brand-new
+  // trace. Stale snapshots from sessions that truly never resume are reclaimed by
+  // the store's age-based GC, not by deleting here.
+  private persistState(): void {
+    if (this.snapshotStore === null || this.queueId === null) return;
+    if (this.rootSpan === null) return; // nothing worth resuming yet
+    try {
+      this.snapshotStore.write(this.queueId, this.serialize());
+    } catch (err) {
+      this.logger.error("codex processor: failed to serialize state", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    }
+  }
+
+  // One-time restore from a snapshot left by a previous server run. Runs lazily
+  // on the first event (after reporting is configured, so the span factory and
+  // tracing-enabled check are settled). Guarded so it happens at most once.
+  private ensureRestored(): void {
+    if (this.restoreAttempted) return;
+    this.restoreAttempted = true;
+    if (this.snapshotStore === null || this.queueId === null) return;
+    // If we've already built a root span this run, there's nothing to restore
+    // (we're the original processor, not a post-restart one).
+    if (this.rootSpan !== null) return;
+    const snapshot = this.snapshotStore.read(this.queueId);
+    if (snapshot === null) return;
+    if (!isCompatibleSnapshot(snapshot, PLUGIN_VERSION)) {
+      this.logger.info("codex processor: snapshot version mismatch; starting fresh", {
+        queueId: this.queueId,
+        snapshotVersion: snapshot.pluginVersion,
+        snapshotSchema: snapshot.schemaVersion,
+      });
+      this.snapshotStore.delete(this.queueId);
+      return;
+    }
+    try {
+      this.restore(snapshot);
+      this.logger.info("codex processor: restored session state from snapshot", {
+        queueId: this.queueId,
+        scopes: snapshot.scopes.length,
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to restore snapshot; starting fresh", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    }
+  }
+
+  // Remember the name/type a span was created (or renamed) with, so it can be
+  // re-asserted on rehydration. Returns the span unchanged for call-site
+  // convenience.
+  private trackSpan(span: Span, name: string, type: SpanRef["type"]): Span {
+    this.spanAttrs.set(span.spanId, { name, type });
+    return span;
+  }
+
+  // Capture a span's identity plus its remembered name/type for the snapshot.
+  private refFor(span: Span): SpanRef {
+    const attrs = this.spanAttrs.get(span.spanId);
+    return spanRef(span, attrs?.name, attrs?.type);
+  }
+
+  // Build a serializable snapshot of all resumable state. Span handles are
+  // captured as identities (spanId/rootSpanId/parents) plus their name/type; the
+  // transcript on disk remains the source of truth for content, so nothing here
+  // re-derives spans.
+  private serialize(): CodexSnapshot {
+    const scopes: ScopeSnapshot[] = [];
+    for (const scope of this.scopes.values()) {
+      scopes.push({
+        path: scope.path,
+        kind: scope.kind,
+        offset: scope.offset,
+        openTurns: Array.from(scope.openTurns, ([turnId, span]) => ({
+          turnId,
+          span: this.refFor(span),
+        })),
+        turnsAwaitingCompletion: Array.from(scope.turnsAwaitingCompletion),
+        conversationHistory: toItemSnapshots(scope.conversationHistory),
+        openLlm:
+          scope.openLlm === null
+            ? null
+            : {
+                span: this.refFor(scope.openLlm.span),
+                turnId: scope.openLlm.turnId,
+                output: toItemSnapshots(scope.openLlm.output),
+                outputPreset: scope.openLlm.outputPreset,
+              },
+        openTools: Array.from(scope.openTools, ([callId, entry]) => ({
+          callId,
+          span: this.refFor(entry.span),
+          turnId: entry.turnId,
+        })),
+        model: scope.model,
+        lastTurnEndTime: scope.lastTurnEndTime,
+        subagentRootSpan:
+          scope.subagentRootSpan === null ? null : this.refFor(scope.subagentRootSpan),
+        subagentEnded: scope.subagentEnded,
+        ...(scope.pendingSubagent !== undefined
+          ? {
+              pendingSubagent: {
+                agentId: scope.pendingSubagent.agentId,
+                agentType: scope.pendingSubagent.agentType,
+                parent: this.refFor(scope.pendingSubagent.parent),
+              },
+            }
+          : {}),
+      });
+    }
+    return {
+      pluginVersion: PLUGIN_VERSION,
+      schemaVersion: SNAPSHOT_SCHEMA_VERSION,
+      sessionId: this.queueId,
+      savedAt: Date.now(),
+      reportingConfig: redactReportingConfig(this.reportingConfig),
+      rootSpan: this.rootSpan === null ? null : this.refFor(this.rootSpan),
+      rootEnded: this.rootEnded,
+      rootEnrichment: { ...this.rootEnrichment },
+      mainScopePath: this.mainScope?.path ?? null,
+      scopes,
+      spawnTurnSpansByCallId: Array.from(this.spawnTurnSpansByCallId, ([key, span]) => ({
+        key,
+        span: this.refFor(span),
+      })),
+      spawnTurnSpansByAgentId: Array.from(this.spawnTurnSpansByAgentId, ([key, span]) => ({
+        key,
+        span: this.refFor(span),
+      })),
+      compactionTriggerByTurn: Array.from(this.compactionTriggerByTurn, ([key, value]) => ({
+        key,
+        value,
+      })),
+      compactionSpansByTurn: Array.from(this.compactionSpansByTurn, ([key, span]) => ({
+        key,
+        span: this.refFor(span),
+      })),
+    };
+  }
+
+  // Rebuild live state from a snapshot. Span handles are recreated bound to their
+  // original ids (so further log()/end() merge into the same rows). Each scope's
+  // lazy parent-span resolver is reconstructed the same way newScope/
+  // handleSubagentStart do, so subsequent transcript records attach correctly.
+  private restore(snapshot: CodexSnapshot): void {
+    // Reporting config first: it determines the span factory (project/creds).
+    // The snapshot is the source of truth — we adopt it as-is rather than
+    // merging in this run's config, so a resume whose env/settings drifted from
+    // the original session can't clobber the snapshot's values. The one field
+    // the snapshot can't carry is the `apiKey` secret (intentionally never
+    // persisted), so we re-attach the live one resolved from this run's config
+    // event / env. This must happen before we touch `this.spanFactory`, which is
+    // built lazily from `this.reportingConfig`.
+    if (snapshot.reportingConfig !== undefined) {
+      this.reportingConfig = {
+        ...snapshot.reportingConfig,
+        apiKey: this.reportingConfig?.apiKey,
+      };
+    }
+
+    const factory = this.spanFactory;
+    // Rehydrate a handle and re-remember its name/type, so if this resumed
+    // processor is itself snapshotted again, the attributes survive the next hop.
+    const rehydrate = (ref: SpanRef): Span => {
+      const span = factory.rehydrateSpan(ref);
+      if (ref.name !== undefined && ref.type !== undefined) {
+        this.spanAttrs.set(span.spanId, { name: ref.name, type: ref.type });
+      }
+      return span;
+    };
+
+    this.rootSpan = snapshot.rootSpan === null ? null : rehydrate(snapshot.rootSpan);
+    this.rootEnded = snapshot.rootEnded;
+    this.rootEnrichment = { ...snapshot.rootEnrichment };
+
+    for (const s of snapshot.scopes) {
+      const isMain = s.path === snapshot.mainScopePath;
+      // The lazy parent resolver mirrors live construction: a main scope's turns
+      // hang under the root span; a subagent scope's under its own (restored)
+      // subagent root span.
+      const scope: TranscriptScope = {
+        path: s.path,
+        kind: s.kind,
+        parentSpan: isMain ? () => this.rootSpan : () => scope.subagentRootSpan,
+        offset: s.offset,
+        openTurns: new Map(s.openTurns.map((t) => [t.turnId, rehydrate(t.span)])),
+        turnsAwaitingCompletion: new Set(s.turnsAwaitingCompletion),
+        conversationHistory: fromItemSnapshots(s.conversationHistory),
+        openLlm:
+          s.openLlm === null
+            ? null
+            : {
+                span: rehydrate(s.openLlm.span),
+                turnId: s.openLlm.turnId,
+                output: fromItemSnapshots(s.openLlm.output),
+                outputPreset: s.openLlm.outputPreset,
+              },
+        openTools: new Map(
+          s.openTools.map((t) => [t.callId, { span: rehydrate(t.span), turnId: t.turnId }]),
+        ),
+        model: s.model,
+        lastTurnEndTime: s.lastTurnEndTime,
+        subagentRootSpan: s.subagentRootSpan === null ? null : rehydrate(s.subagentRootSpan),
+        subagentEnded: s.subagentEnded,
+        ...(s.pendingSubagent !== undefined
+          ? {
+              pendingSubagent: {
+                agentId: s.pendingSubagent.agentId,
+                agentType: s.pendingSubagent.agentType,
+                parent: rehydrate(s.pendingSubagent.parent),
+              },
+            }
+          : {}),
+      };
+      this.scopes.set(s.path, scope);
+      if (isMain) this.mainScope = scope;
+    }
+
+    for (const e of snapshot.spawnTurnSpansByCallId) {
+      this.spawnTurnSpansByCallId.set(e.key, rehydrate(e.span));
+    }
+    for (const e of snapshot.spawnTurnSpansByAgentId) {
+      this.spawnTurnSpansByAgentId.set(e.key, rehydrate(e.span));
+    }
+    for (const e of snapshot.compactionTriggerByTurn) {
+      this.compactionTriggerByTurn.set(e.key, e.value);
+    }
+    for (const e of snapshot.compactionSpansByTurn) {
+      this.compactionSpansByTurn.set(e.key, rehydrate(e.span));
     }
   }
 

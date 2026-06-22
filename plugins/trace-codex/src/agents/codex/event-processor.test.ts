@@ -1118,6 +1118,10 @@ describe("CodexEventProcessor: config / master switch", () => {
         ({ id: "s", end: () => 0, log: () => {} }) as unknown as ReturnType<
           SpanFactory["startSpan"]
         >,
+      rehydrateSpan: () =>
+        ({ id: "s", end: () => 0, log: () => {} }) as unknown as ReturnType<
+          SpanFactory["startSpan"]
+        >,
       flush: async () => {},
     };
     const provider = (config?: ReportingConfig) => {

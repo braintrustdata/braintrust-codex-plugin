@@ -95,20 +95,71 @@ fire-and-forget: the client POSTs to `/enqueue` and returns immediately, while
 the background server does the slow work (Braintrust SDK calls, flushes) off the
 critical path.
 
-We **deliberately block in a few places**, and only where correctness requires
-it:
+The terminal event is the one place where blocking is even an option, and it's
+**opt-in**:
 
-- On a **terminal event** (`Stop`), the client calls `/flush` and waits for the
-  server to confirm buffered spans reached Braintrust. Without this, a
-  short-lived host (e.g. a CI job that ends right after the last turn) would tear
-  the process tree down before the final spans are delivered. This is the one
-  routine blocking point, and it's bounded by a timeout (`/flush` gives up rather
-  than hanging the turn).
+- On a **terminal event** (`Stop`), the client always calls `/flush`, but by
+  default it fires the flush and returns immediately so the turn isn't stalled.
+  Setting `BRAINTRUST_PLUGIN_BLOCK_ON_STOP` makes the client instead wait for the
+  server to confirm buffered spans reached Braintrust. The blocking mode exists
+  for short-lived hosts (e.g. a CI job that ends right after the last turn) that
+  would otherwise tear the process tree down before the final spans are
+  delivered. When enabled, the wait is bounded by a timeout (`/flush` gives up
+  rather than hanging the turn). In normal interactive use the server stays alive
+  and flushes off the critical path, so no spans are lost without blocking.
 
 When adding behavior, prefer enqueue-and-return. Reach for a blocking
 request/await only when data would otherwise be lost, keep it off the
 per-hook hot path where possible, and always bound it so a slow or stuck backend
 can't stall the agent.
+
+### 4. Sessions can outlive the server (resume)
+
+The server is short-lived (idle shutdown after ~5 min, or the user closes and
+later resumes). A Codex session, though, can span that gap. To avoid dropping
+the tail of a trace — or worse, re-emitting it as duplicate/orphaned spans — the
+Codex processor **persists its resumable state** and rehydrates it when a new
+processor is created for the same session id.
+
+How it works:
+
+- The transcript (rollout JSONL) on disk is the durable source of truth for span
+  *content*. What a restart loses is the processor's in-memory bookkeeping:
+  transcript byte offsets, which spans are still open (and their identities),
+  the reconstructed conversation history, and the subagent/compaction side-maps.
+- On every `flush()` (idle drain, eviction, terminal Stop, shutdown), the
+  processor writes a JSON snapshot of that bookkeeping to
+  `PLUGIN_DATA/state/<sessionId>.json` (`src/agents/codex/snapshot-store.ts`).
+  Span handles are stored as identities (`span_id`/`root_span_id`/`parents` plus
+  name/type), captured from the SDK's synchronous span getters.
+- On its first event, a processor attempts a one-time restore for its session
+  id. If a compatible snapshot exists, it recreates each span handle bound to the
+  original id via `SpanFactory.rehydrateSpan` (Braintrust merges rows by
+  `span_id`, so further `log()`/`end()` calls continue the same trace). Restore
+  runs **before** the tracing-enabled master switch, because the snapshot also
+  carries the session's reporting config (a bare mid-session restart may have no
+  leading config event).
+- The snapshot is **not** deleted when the root span ends. Codex's `Stop` hook is
+  per-**turn**, not per-session (there is no session-end hook), and we end the
+  root on the first `Stop` — but later turns still attach as children of that same
+  root, so a restart *between* turns must be able to resume. The snapshot
+  therefore persists past root-end; stale ones (sessions that never resume) are
+  reclaimed by a startup GC sweep that removes snapshots older than a TTL.
+
+Invariants to preserve when changing this:
+
+- **Persistence is Codex-owned**, not part of the generic event server: *where* a
+  plugin may persist state is the host agent's call (Codex gives us
+  `PLUGIN_DATA`). Keep the store and snapshot shape under `src/agents/codex/`.
+  The only generic addition is `SpanFactory.rehydrateSpan` (pure SDK behavior).
+- **Never persist secrets.** The `apiKey` is stripped from the snapshot's
+  reporting config and re-resolved from env / the config event on resume (mirrors
+  the event recorder's redaction).
+- **Never throw.** The store swallows and logs all I/O errors; a persistence or
+  restore failure must not break a turn — it just falls back to starting fresh.
+- **Version-gate snapshots.** Each carries `pluginVersion` + a schema version;
+  a mismatch discards the snapshot. Bump `SNAPSHOT_SCHEMA_VERSION` in
+  `state-snapshot.ts` whenever the shape changes incompatibly.
 
 ## Making changes
 

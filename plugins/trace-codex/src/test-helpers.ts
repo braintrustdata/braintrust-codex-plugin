@@ -1,7 +1,7 @@
 // Shared test helpers.
 
 import { _exportsForTestingOnly, initLogger } from "braintrust";
-import type { Span, SpanFactory, StartSpanArgs } from "./braintrust/logger.ts";
+import type { Span, SpanFactory, SpanRef, StartSpanArgs } from "./braintrust/logger.ts";
 import type { Logger } from "./log.ts";
 
 /** A no-op logger for tests; never touches the filesystem. */
@@ -42,6 +42,25 @@ export function createFakeSpanFactory(): FakeSpanFactory {
       };
       spans.push(fake);
       // Only the members the processor uses are needed; cast through unknown.
+      return {
+        id: fake.id,
+        flush: async () => {
+          fake.flushCount += 1;
+        },
+        end: () => {
+          fake.endCount += 1;
+          return 0;
+        },
+      } as unknown as Span;
+    },
+    rehydrateSpan(ref: SpanRef): Span {
+      const fake: FakeSpan = {
+        id: ref.spanId,
+        startArgs: {},
+        flushCount: 0,
+        endCount: 0,
+      };
+      spans.push(fake);
       return {
         id: fake.id,
         flush: async () => {
@@ -110,6 +129,13 @@ export function withCapturedTrace(): CapturedTrace {
   return {
     spanFactory: {
       startSpan: (args) => logger.startSpan(args),
+      rehydrateSpan: (ref) =>
+        logger.startSpan({
+          spanId: ref.spanId,
+          parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
+          ...(ref.name !== undefined ? { name: ref.name } : {}),
+          ...(ref.type !== undefined ? { type: ref.type } : {}),
+        }),
       flush: () => logger.flush(),
     },
     drain: async () => {
@@ -137,8 +163,46 @@ export interface SpanTree {
   children: SpanTree[];
 }
 
+/**
+ * Merge captured span rows that share a span_id into one logical span, the way
+ * Braintrust merges rows server-side. Multiple rows for one span_id occur when a
+ * span is logged across several calls (e.g. start, then output, then end) and
+ * especially when a span is rehydrated after a server restart: the resumed
+ * handle re-emits rows under the original id. Later non-empty fields win;
+ * metadata and span_attributes are shallow-merged so partial updates accumulate.
+ */
+export function mergeCapturedSpans(spans: CapturedSpan[]): CapturedSpan[] {
+  const byId = new Map<string, CapturedSpan>();
+  const order: string[] = [];
+  for (const span of spans) {
+    const existing = byId.get(span.span_id);
+    if (existing === undefined) {
+      byId.set(span.span_id, { ...span });
+      order.push(span.span_id);
+      continue;
+    }
+    // Merge: later rows override, but don't clobber an existing value with
+    // undefined (a partial row that omits a field shouldn't erase it).
+    const merged: CapturedSpan = { ...existing };
+    for (const [key, value] of Object.entries(span) as [keyof CapturedSpan, unknown][]) {
+      if (value === undefined) continue;
+      if (key === "metadata" || key === "span_attributes" || key === "metrics") {
+        merged[key] = {
+          ...(existing[key] as Record<string, unknown> | undefined),
+          ...(value as Record<string, unknown>),
+        } as never;
+      } else {
+        merged[key] = value as never;
+      }
+    }
+    byId.set(span.span_id, merged);
+  }
+  return order.map((id) => byId.get(id) as CapturedSpan);
+}
+
 /** Build a single-rooted tree from flat captured spans (via span_parents). */
-export function spansToTree(spans: CapturedSpan[]): SpanTree | null {
+export function spansToTree(rawSpans: CapturedSpan[]): SpanTree | null {
+  const spans = mergeCapturedSpans(rawSpans);
   if (spans.length === 0) return null;
 
   const root = spans.find(

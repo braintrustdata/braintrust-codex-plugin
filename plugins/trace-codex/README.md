@@ -33,6 +33,19 @@ Every setting can be provided as a `config.json` key or as an environment variab
 | `blockOnStop`        | `BRAINTRUST_PLUGIN_BLOCK_ON_STOP`     | `false`            | When `true`, the hook blocks on each turn's `Stop` until the server confirms all spans are flushed. Use in programmatic/CI runs to guarantee traces are delivered before Codex exits. |
 | `recordFile`         | `BRAINTRUST_EVENT_SERVER_RECORD_FILE` | _(unset)_          | If set, record every event to this NDJSON file (for `replay`).                                                                               |
 
+### Resuming sessions
+
+Note that when resuming a session, the original session's options will remain in effect.
+
+For example:
+
+```sh
+TRACE_TO_BRAINTRUST=true codex # first session enables braintrust
+TRACE_TO_BRAINTRUST=false codex resume abcde # the resumed session will still be traced because the original session was
+```
+
+The trace itself also survives the background server stopping. The server shuts down after the idle window (or on an explicit shutdown), but a session can outlive it — you might leave it open past the timeout, send another message after the server stopped, or `codex resume` later. The plugin snapshots each session's in-progress trace state under `$PLUGIN_DATA/state/` and restores it when the session continues, so later turns keep landing in the same trace instead of starting a new one. Stale snapshots age out automatically, and secrets (your API key) are never written to them.
+
 ### Advanced Options
 
 Advanced plugin settings for debugging or developing the plugin
