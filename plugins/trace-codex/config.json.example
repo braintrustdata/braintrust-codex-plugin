@@ -6,6 +6,7 @@
   "appUrl": "https://www.braintrust.dev",
   "project": "my-codex-project",
   "additionalMetadata": { "team": "platform", "env": "dev" },
+  "blockOnStop": false,
   "recordFile": "",
   "port": 52734,
   "idleTimeoutMs": 300000,

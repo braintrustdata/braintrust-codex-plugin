@@ -28,6 +28,11 @@ export interface RouteDeps {
   logger: Logger;
   /** Queue that /enqueue pushes events onto. */
   queue: EventQueue;
+  /**
+   * Signal every active processor to flush its buffered state now, without
+   * waiting for the queue to drain. Used by the non-blocking /flush path.
+   */
+  flushProcessors: () => Promise<void>;
   /** Invoked when /shutdown is hit, after the response is constructed. */
   onShutdownRequested: () => void;
 }
@@ -45,7 +50,7 @@ const SERVICE_UNAVAILABLE = () => json({ error: "shutting_down" }, 503);
 const FLUSH_TIMEOUT_MS = 10_000;
 
 export async function handleRequest(req: Request, deps: RouteDeps): Promise<Response> {
-  const { state, logger, queue, onShutdownRequested } = deps;
+  const { state, logger, queue, flushProcessors, onShutdownRequested } = deps;
   const url = new URL(req.url);
   const path = url.pathname;
 
@@ -82,13 +87,24 @@ export async function handleRequest(req: Request, deps: RouteDeps): Promise<Resp
     return json({ ok: true });
   }
 
-  // POST /flush
-  // Wait until everything enqueued so far has been processed and buffered spans
-  // have been flushed to the backend, then respond. Used by the hook client on
-  // terminal events (e.g. Codex "Stop") so the final spans are delivered before
-  // the process tree is torn down — important in short-lived environments like
-  // CI where the background server won't survive to flush on idle.
+  // POST /flush[?block=<bool>] (block defaults to false)
+  //
+  // block=true: wait until everything enqueued so far has been processed AND
+  //   buffered spans have been flushed to the backend, then respond. Used on
+  //   terminal events / shutdown in short-lived environments (e.g. CI) where the
+  //   background server won't survive to flush on idle, so the final spans must
+  //   be delivered before the process tree is torn down.
+  //
+  // block=false: don't wait for the queue to drain. Just send the flush signal
+  //   through to every active processor (each delivers its buffered spans) and
+  //   respond immediately. Use this for periodic/best-effort flushes that must
+  //   not stall the caller.
   if (path === "/flush" && req.method === "POST") {
+    const block = parseBoolParam(url.searchParams.get("block"));
+    if (!block) {
+      await flushProcessors();
+      return json({ ok: true, blocked: false });
+    }
     const flushed = await Promise.race([
       queue.drained().then(() => true),
       // Bound the wait so a hung backend flush can't hold the request lock (and
@@ -99,7 +115,7 @@ export async function handleRequest(req: Request, deps: RouteDeps): Promise<Resp
       logger.warn("flush timed out waiting for queue to drain");
       return json({ ok: false, timedOut: true }, 200);
     }
-    return json({ ok: true });
+    return json({ ok: true, blocked: true });
   }
 
   // POST /shutdown
@@ -113,6 +129,13 @@ export async function handleRequest(req: Request, deps: RouteDeps): Promise<Resp
   }
 
   return json({ error: "not_found" }, 404);
+}
+
+/** Parse a query-param boolean: true only for "true"/"1" (case-insensitive). */
+function parseBoolParam(value: string | null): boolean {
+  if (value === null) return false;
+  const v = value.trim().toLowerCase();
+  return v === "true" || v === "1";
 }
 
 function isValidEnqueueEvent(value: unknown): value is EnqueueEvent {

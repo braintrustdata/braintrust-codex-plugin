@@ -633,10 +633,11 @@ describe("CodexEventProcessor: transcript catch-up plumbing", () => {
     );
   });
 
-  test("flush polls the transcript until an open turn's task_complete appears", async () => {
-    // A reader that withholds its last appended line until a later read, modeling
-    // a task_complete that lands after the terminal Stop. flush() must poll until
-    // it appears and then close the turn.
+  test("a turn whose task_complete lands after its Stop is closed by the bounded wait", async () => {
+    // Regression for the live bug: Codex writes task_complete seconds after the
+    // Stop hook fires. The Stop's initial read doesn't see it (turn stays open),
+    // so the bounded waitFor must keep reading until it appears, then close the
+    // turn — with the transcript-derived end time, not a wall-clock value.
     class DelayedRevealReader implements TranscriptReader {
       private lines: string[] = [];
       private withheld: string | null = null;

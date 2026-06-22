@@ -99,6 +99,7 @@ export function startServer(
           state,
           logger: log,
           queue,
+          flushProcessors: () => registry.flushAll(),
           onShutdownRequested: () => {
             void stop();
           },

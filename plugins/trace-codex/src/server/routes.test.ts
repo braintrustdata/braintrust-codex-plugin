@@ -14,6 +14,7 @@ function makeDeps(overrides: Partial<RouteDeps> = {}): RouteDeps {
     state: new ServerState(TEST_VERSION),
     logger,
     queue: new EventQueue({ logger }),
+    flushProcessors: async () => {},
     onShutdownRequested: () => {},
     ...overrides,
   };
@@ -119,7 +120,7 @@ describe("POST /flush", () => {
     eventData: { hook_event_name: "Stop" },
   };
 
-  test("waits for the queue to drain, then returns ok", async () => {
+  test("block=true waits for the queue to drain, then returns ok", async () => {
     const processed: string[] = [];
     const logger = createTestLogger();
     const queue = new EventQueue({
@@ -132,16 +133,53 @@ describe("POST /flush", () => {
     queue.start();
     const deps = makeDeps({ logger, queue });
 
-    // Enqueue a Stop, then flush. The flush response must come only after the
-    // event has been processed.
+    // Enqueue a Stop, then flush(block=true). The flush response must come only
+    // after the event has been processed.
     await handleRequest(post("/enqueue", validEvent), deps);
-    const res = await handleRequest(post("/flush"), deps);
+    const res = await handleRequest(post("/flush?block=true"), deps);
 
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, blocked: true });
     expect(processed).toEqual(["Stop"]);
 
     await queue.stop();
+  });
+
+  test("block=false signals processors and returns immediately (no queue drain)", async () => {
+    let flushSignals = 0;
+    // The consumer is never started, so the enqueued event stays unprocessed and
+    // the queue never drains. A non-blocking flush must still return promptly,
+    // having signalled the processors.
+    const logger = createTestLogger();
+    const queue = new EventQueue({ logger });
+    const deps = makeDeps({
+      logger,
+      queue,
+      flushProcessors: async () => {
+        flushSignals += 1;
+      },
+    });
+
+    await handleRequest(post("/enqueue", validEvent), deps);
+    expect(queue.size).toBe(1); // still queued, not drained
+    const res = await handleRequest(post("/flush?block=false"), deps);
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, blocked: false });
+    expect(flushSignals).toBe(1);
+    expect(queue.size).toBe(1); // flush did not wait for / cause a drain
+  });
+
+  test("defaults to non-blocking when no block param is given", async () => {
+    let flushSignals = 0;
+    const deps = makeDeps({
+      flushProcessors: async () => {
+        flushSignals += 1;
+      },
+    });
+    const res = await handleRequest(post("/flush"), deps);
+    expect(await res.json()).toEqual({ ok: true, blocked: false });
+    expect(flushSignals).toBe(1);
   });
 });
 

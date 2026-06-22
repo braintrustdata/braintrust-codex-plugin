@@ -70,6 +70,16 @@ describe("loadSettingsFile", () => {
     expect(loadSettingsFile(path)).toEqual({});
   });
 
+  test("parses blockOnStop boolean; ignores non-boolean", () => {
+    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: true })))).toEqual({
+      blockOnStop: true,
+    });
+    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: false })))).toEqual({
+      blockOnStop: false,
+    });
+    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: "yes" })))).toEqual({});
+  });
+
   test("missing file returns {}", () => {
     expect(loadSettingsFile(join(dir, "absent.json"))).toEqual({});
   });
@@ -124,6 +134,13 @@ describe("applySettingsToEnv", () => {
     applySettingsToEnv({ traceToBraintrust: true, additionalMetadata: { team: "platform" } }, env);
     expect(env.TRACE_TO_BRAINTRUST).toBe("true");
     expect(env.BRAINTRUST_ADDITIONAL_METADATA).toBe('{"team":"platform"}');
+  });
+
+  test("maps blockOnStop to BRAINTRUST_PLUGIN_BLOCK_ON_STOP", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const applied = applySettingsToEnv({ blockOnStop: true }, env);
+    expect(env.BRAINTRUST_PLUGIN_BLOCK_ON_STOP).toBe("true");
+    expect(applied).toEqual(["blockOnStop"]);
   });
 });
 

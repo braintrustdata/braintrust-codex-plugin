@@ -58,16 +58,19 @@ const SESSION_START = "SessionStart";
 const STOP = "Stop";
 
 // Bound on how long a Stop hook waits for the turn's task_complete to appear in
-// the transcript before giving up and emitting whatever exists. Small so a slow
-// or stuck writer can never stall the Codex turn.
-const SENTINEL_TIMEOUT_MS = 2000;
+// the transcript before giving up and emitting whatever exists. Codex can write
+// task_complete several seconds after firing the Stop hook, so this is generous;
+// the wait returns as soon as the sentinel is seen, and only the last turn of a
+// session ever relies on it (earlier turns are closed by the next hook's
+// catch-up). Still bounded so a stuck writer can never stall the Codex turn.
+const SENTINEL_TIMEOUT_MS = 10_000;
 const SENTINEL_INTERVAL_MS = 25;
 
 // Bound on how long flush() polls the transcript for still-open turns to close
-// (their task_complete can land slightly after the terminal Stop). Larger than
-// the per-hook wait since flush is off the Codex hot path, but still bounded so
-// a stuck writer can't hang shutdown.
-const FLUSH_TIMEOUT_MS = 5000;
+// (their task_complete can land seconds after the terminal Stop). flush() is off
+// the Codex hot path, so this is generous; it returns immediately once no turns
+// remain open, and is still bounded so a stuck writer can't hang shutdown.
+const FLUSH_TIMEOUT_MS = 15_000;
 const FLUSH_INTERVAL_MS = 50;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -118,6 +121,11 @@ export class CodexEventProcessor implements EventProcessor {
   // Turn spans currently open, keyed by turn_id. A turn is opened by
   // task_started and closed by the matching task_complete.
   private readonly openTurns = new Map<string, Span>();
+  // turn_ids whose Stop hook has fired but whose task_complete hasn't been seen
+  // yet (Codex can write task_complete seconds after the Stop hook). flush()
+  // only blocks-and-polls when one of these is still open; a turn that is merely
+  // mid-progress (no Stop yet) does not make an idle flush wait.
+  private readonly turnsAwaitingCompletion = new Set<string>();
   // Tool spans currently open, keyed by call_id. Opened by a tool-call
   // response_item and closed by the matching *_output. The owning turn_id is
   // tracked so any still-open tool spans are ended when their turn ends.
@@ -188,6 +196,14 @@ export class CodexEventProcessor implements EventProcessor {
       this.recordRootEnrichment(event);
     }
 
+    // A Stop signals its turn is finishing; mark it so flush knows to wait for
+    // this turn's task_complete (which Codex may write after the Stop hook).
+    if (event.eventName === STOP) {
+      const data = (event.eventData ?? {}) as Record<string, unknown>;
+      const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
+      if (turnId !== undefined) this.turnsAwaitingCompletion.add(turnId);
+    }
+
     try {
       await this.catchUpTranscript(event);
     } catch (err) {
@@ -208,41 +224,44 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // Read transcript lines appended since our last read and turn each into spans.
-  // The transcript path comes from the hook payload. On a Stop hook we first
-  // wait (bounded) for the turn's task_complete to be written, so the turn's
-  // final records aren't missed due to a write race. Never throws.
+  // The transcript path comes from the hook payload. Never throws.
+  //
+  // On a Stop, first consume whatever's already on disk. If that closes the
+  // turn, we're done. Otherwise Codex hasn't written this turn's task_complete
+  // yet (it can lag the Stop hook by seconds), so wait (bounded) for it — but
+  // only then, so a Stop whose turn is already complete returns immediately.
   private async catchUpTranscript(event: EnqueueEvent): Promise<void> {
     const data = (event.eventData ?? {}) as Record<string, unknown>;
     const path = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
     if (path === undefined) return;
     this.transcriptPath = path;
 
-    let lines: string[];
-    let offset: number;
-    if (event.eventName === STOP) {
-      const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
-      const result = await this.transcriptReader.waitFor(
-        path,
-        this.transcriptOffset,
-        (line) => this.isTaskCompleteFor(line, turnId),
-        { timeoutMs: SENTINEL_TIMEOUT_MS, intervalMs: SENTINEL_INTERVAL_MS },
-      );
-      lines = result.lines;
-      offset = result.offset;
-      if (!result.sentinelFound) {
-        this.logger.warn("codex processor: Stop sentinel not found; emitting partial turn", {
-          queueId: this.queueId,
-          turnId,
-        });
-      }
-    } else {
-      const result = this.transcriptReader.readFrom(path, this.transcriptOffset);
-      lines = result.lines;
-      offset = result.offset;
-    }
+    // Initial read of everything available now.
+    const initial = this.transcriptReader.readFrom(path, this.transcriptOffset);
+    this.transcriptOffset = initial.offset;
+    this.consumeLines(initial.lines);
 
-    this.transcriptOffset = offset;
-    this.consumeLines(lines);
+    if (event.eventName !== STOP) return;
+
+    const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
+    // If the turn already closed during the initial read, no wait is needed.
+    if (turnId === undefined || !this.openTurns.has(turnId)) return;
+
+    // Wait (bounded) for this turn's task_complete to be written.
+    const result = await this.transcriptReader.waitFor(
+      path,
+      this.transcriptOffset,
+      (line) => this.isTaskCompleteFor(line, turnId),
+      { timeoutMs: SENTINEL_TIMEOUT_MS, intervalMs: SENTINEL_INTERVAL_MS },
+    );
+    this.transcriptOffset = result.offset;
+    this.consumeLines(result.lines);
+    if (!result.sentinelFound) {
+      this.logger.warn("codex processor: Stop sentinel not found; emitting partial turn", {
+        queueId: this.queueId,
+        turnId,
+      });
+    }
   }
 
   // Parse and process a batch of transcript lines into spans, advancing nothing
@@ -538,6 +557,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
     } finally {
       this.openTurns.delete(turnId);
+      this.turnsAwaitingCompletion.delete(turnId);
     }
   }
 
@@ -681,6 +701,16 @@ export class CodexEventProcessor implements EventProcessor {
     return last;
   }
 
+  // Number of turns whose Stop has fired but which are still open (awaiting
+  // their task_complete). flush() polls only while this is > 0.
+  private countPendingTurns(): number {
+    let n = 0;
+    for (const turnId of this.turnsAwaitingCompletion) {
+      if (this.openTurns.has(turnId)) n += 1;
+    }
+    return n;
+  }
+
   // End the root span on the first Stop hook. Subsequent Stops are ignored
   // (the SDK records a span's end time once). `endTime` is the completing turn's
   // end time so the root isn't stamped with a late wall-clock value; falls back
@@ -748,9 +778,13 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // Read and process new transcript records, retrying on a bounded interval,
-  // until no turn spans remain open or the timeout elapses. Always does at least
-  // one read so a task_complete already on disk closes its turn immediately. On
-  // timeout, leaves whatever is still open for endRootSpan's backstop to close.
+  // until no turn that has seen its Stop is still open (its task_complete can
+  // land seconds after the Stop hook) or the timeout elapses. Always does at
+  // least one read so a task_complete already on disk closes its turn
+  // immediately. Crucially, this does NOT wait for turns that are merely
+  // mid-progress (no Stop yet) — so an idle flush during an active turn returns
+  // promptly instead of blocking. On timeout, leaves whatever is still open for
+  // endRootSpan's backstop to close.
   private async drainOpenTurns(): Promise<void> {
     if (this.transcriptPath === null) return;
     const deadline = Date.now() + FLUSH_TIMEOUT_MS;
@@ -769,11 +803,14 @@ export class CodexEventProcessor implements EventProcessor {
         });
         return;
       }
-      if (this.openTurns.size === 0 || Date.now() >= deadline) {
-        if (this.openTurns.size > 0) {
-          this.logger.warn("codex processor: turns still open at flush timeout", {
+      // Only turns whose Stop has fired but whose task_complete hasn't arrived
+      // keep us waiting. (endTurnSpan removes them from both sets as they close.)
+      const pending = this.countPendingTurns();
+      if (pending === 0 || Date.now() >= deadline) {
+        if (pending > 0) {
+          this.logger.warn("codex processor: turns awaiting completion at flush timeout", {
             queueId: this.queueId,
-            openTurns: this.openTurns.size,
+            pending,
           });
         }
         return;

@@ -31,24 +31,31 @@ export async function postEnqueue(
 }
 
 /**
- * Ask the server to process everything enqueued so far and flush buffered spans
- * to the backend, then wait for it to confirm. Returns true on a 2xx response.
- * Never throws.
+ * Ask the server to flush. Returns true on a 2xx response. Never throws.
  *
- * The hook calls this after a terminal event so the final spans are delivered
- * before the process tree is torn down (e.g. when a CI job ends right after the
- * agent's last turn, before the background server's idle timeout fires).
+ * When `block` is true (the default), the server waits until everything
+ * enqueued so far has been processed and buffered spans have reached the backend
+ * before responding. The hook uses this after a terminal event so the final
+ * spans are delivered before the process tree is torn down (e.g. a CI job ending
+ * right after the agent's last turn, before the idle timeout fires).
+ *
+ * When `block` is false, the server just signals every processor to flush its
+ * buffered state and responds immediately, without waiting for the queue to
+ * drain — for periodic/best-effort flushes that must not stall the caller.
  */
 export async function postFlush(
   config: Pick<Config, "host" | "port">,
   logger: Logger,
+  options: { block?: boolean } = {},
 ): Promise<boolean> {
+  const block = options.block ?? true;
   try {
-    const res = await fetch(`${serverBaseUrl(config)}/flush`, {
+    const res = await fetch(`${serverBaseUrl(config)}/flush?block=${block}`, {
       method: "POST",
-      // The server bounds its own wait (FLUSH_TIMEOUT_MS); allow a little more
-      // here so we receive its response rather than aborting the request.
-      signal: AbortSignal.timeout(12_000),
+      // A blocking flush waits on the server (bounded by FLUSH_TIMEOUT_MS); allow
+      // a little more here so we receive its response rather than aborting. A
+      // non-blocking flush returns promptly, so a short timeout suffices.
+      signal: AbortSignal.timeout(block ? 12_000 : 2_000),
     });
     if (!res.ok) {
       logger.warn("flush rejected", { status: res.status });

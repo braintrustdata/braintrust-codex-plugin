@@ -34,11 +34,18 @@ async function readStdin(): Promise<string> {
 export interface HookClientOptions {
   /**
    * Event names that terminate a turn/session. After enqueuing one of these,
-   * the client asks the server to flush synchronously (POST /flush) so the
-   * final spans are delivered before this process — and any background server —
-   * is torn down. Defaults to none (fire-and-forget).
+   * the client asks the server to flush (POST /flush) so buffered spans are
+   * delivered. Defaults to none (fire-and-forget).
    */
   terminalEvents?: readonly string[];
+  /**
+   * Whether the terminal-event flush blocks until the server confirms all
+   * events are processed and spans are delivered (block=true), versus a
+   * fire-and-forget signal that returns immediately (block=false). Defaults to
+   * false; set true (via BRAINTRUST_PLUGIN_BLOCK_ON_STOP) to guarantee delivery
+   * before Codex exits, e.g. in programmatic/CI runs.
+   */
+  blockOnStop?: boolean;
 }
 
 export async function runHookClient(
@@ -79,12 +86,15 @@ export async function runHookClient(
     }
   }
 
-  // On a terminal event, block until the server confirms the queue has drained
-  // and buffered spans are flushed. Without this, a CI job (or any short-lived
-  // host) can end right after the agent's last turn — before the background
-  // server's idle timeout fires — and lose the final spans.
+  // On a terminal event, flush. When blockOnStop is set, block until the server
+  // confirms the queue has drained and buffered spans are delivered — important
+  // for a CI job (or any short-lived host) that ends right after the agent's
+  // last turn, before the background server's idle timeout fires, which would
+  // otherwise lose the final spans. Otherwise fire-and-forget so the turn isn't
+  // stalled; the background server delivers spans on its own.
   if (sawTerminal) {
-    const flushed = await postFlush(config, logger);
-    logger.debug("flush requested on terminal event", { flushed });
+    const block = options.blockOnStop ?? false;
+    const flushed = await postFlush(config, logger, { block });
+    logger.debug("flush requested on terminal event", { flushed, block });
   }
 }
