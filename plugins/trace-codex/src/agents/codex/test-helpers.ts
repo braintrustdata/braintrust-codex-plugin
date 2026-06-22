@@ -37,6 +37,14 @@ export function userPromptSubmit(data: Record<string, unknown> = {}): EnqueueEve
   return codexEvent("UserPromptSubmit", { session_id: "session-1", ...data });
 }
 
+export function preToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexEvent("PreToolUse", { session_id: "session-1", ...data });
+}
+
+export function postToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexEvent("PostToolUse", { session_id: "session-1", ...data });
+}
+
 export function stop(data: Record<string, unknown> = {}): EnqueueEvent {
   return codexEvent("Stop", { session_id: "session-1", ...data });
 }

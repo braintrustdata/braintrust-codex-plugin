@@ -7,6 +7,8 @@ import { CodexEventProcessor } from "./event-processor.ts";
 import {
   assertProducesTrace,
   configEvent,
+  postToolUse,
+  preToolUse,
   sessionStart,
   stop,
   userPromptSubmit,
@@ -253,6 +255,142 @@ describe("CodexEventProcessor", () => {
         // team comes from additionalMetadata; model is the standard key (wins).
         metadata: { team: "platform", model: "gpt-5.5", project: "team-project" },
         children: [],
+      },
+    );
+  });
+
+  test("a paired tool call becomes a 'tool' span under its turn", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart({ model: "gpt-5.5", source: "startup" }),
+        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
+        preToolUse({
+          turn_id: "t1",
+          tool_name: "Bash",
+          tool_use_id: "call_1",
+          tool_input: { command: "ls" },
+        }),
+        postToolUse({
+          turn_id: "t1",
+          tool_name: "Bash",
+          tool_use_id: "call_1",
+          tool_response: "file.txt",
+        }),
+        stop({ turn_id: "t1", last_assistant_message: "done" }),
+      ],
+      {
+        span_attributes: { name: "codex session", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            input: "run it",
+            output: "done",
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "Bash", type: "tool" },
+                input: { command: "ls" },
+                output: "file.txt",
+                metadata: { tool_name: "Bash", tool_use_id: "call_1", turn_id: "t1" },
+                ended: true,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("multiple tool calls in one turn become sibling tool spans", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart({ model: "gpt-5.5", source: "startup" }),
+        userPromptSubmit({ prompt: "do two things", turn_id: "t1" }),
+        preToolUse({ turn_id: "t1", tool_name: "Bash", tool_use_id: "call_1" }),
+        postToolUse({ turn_id: "t1", tool_use_id: "call_1", tool_response: "a" }),
+        preToolUse({ turn_id: "t1", tool_name: "apply_patch", tool_use_id: "call_2" }),
+        postToolUse({ turn_id: "t1", tool_use_id: "call_2", tool_response: "b" }),
+        stop({ turn_id: "t1", last_assistant_message: "done" }),
+      ],
+      {
+        span_attributes: { name: "codex session", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              { span_attributes: { name: "Bash", type: "tool" }, output: "a", ended: true },
+              {
+                span_attributes: { name: "apply_patch", type: "tool" },
+                output: "b",
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("an unpaired PreToolUse (no PostToolUse) is closed when its turn ends", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart({ model: "gpt-5.5", source: "startup" }),
+        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
+        preToolUse({
+          turn_id: "t1",
+          tool_name: "Bash",
+          tool_use_id: "call_1",
+          tool_input: { command: "ls" },
+        }),
+        // No PostToolUse for call_1 (e.g. interrupted), then the turn stops.
+        stop({ turn_id: "t1", last_assistant_message: "done" }),
+      ],
+      {
+        span_attributes: { name: "codex session", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "Bash", type: "tool" },
+                input: { command: "ls" },
+                // No output (PostToolUse never arrived), but the span is ended.
+                ended: true,
+                children: [],
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("a tool call with no matching open turn span is skipped", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart({ model: "gpt-5.5", source: "startup" }),
+        userPromptSubmit({ prompt: "run it", turn_id: "t1" }),
+        // turn_id "tX" was never opened; the tool span must be skipped.
+        preToolUse({ turn_id: "tX", tool_name: "Bash", tool_use_id: "call_1" }),
+        postToolUse({ turn_id: "tX", tool_use_id: "call_1", tool_response: "x" }),
+        stop({ turn_id: "t1", last_assistant_message: "done" }),
+      ],
+      {
+        span_attributes: { name: "codex session", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [],
+          },
+        ],
       },
     );
   });

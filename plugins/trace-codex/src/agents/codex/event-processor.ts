@@ -3,8 +3,10 @@
 // builds its own per-session SpanFactory. On SessionStart it opens a Braintrust
 // root span. Each turn is a child span: UserPromptSubmit opens it (input = the
 // user prompt), and the matching Stop closes it (output = the final assistant
-// message). The first Stop also ends the root span. Buffered spans are delivered
-// via flush().
+// message). Tool calls are grandchild spans: PreToolUse opens a "tool" span under
+// the matching turn (input = tool_input), and the matching PostToolUse (paired by
+// tool_use_id) closes it (output = tool_response). The first Stop also ends the
+// root span. Buffered spans are delivered via flush().
 
 import {
   defaultSpanFactoryProvider,
@@ -20,6 +22,8 @@ import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
 
 const SESSION_START = "SessionStart";
 const USER_PROMPT_SUBMIT = "UserPromptSubmit";
+const PRE_TOOL_USE = "PreToolUse";
+const POST_TOOL_USE = "PostToolUse";
 const STOP = "Stop";
 
 /**
@@ -46,6 +50,11 @@ export class CodexEventProcessor implements EventProcessor {
   // Turn spans currently open, keyed by turn_id. A turn is opened by
   // UserPromptSubmit and closed (ended) by the matching Stop.
   private readonly openTurns = new Map<string, Span>();
+  // Tool spans currently open, keyed by tool_use_id. A tool span is opened by
+  // PreToolUse (as a child of its turn) and closed by the matching PostToolUse.
+  // The owning turn_id is tracked so any still-open tool spans are ended when
+  // their turn (or the root) ends.
+  private readonly openTools = new Map<string, { span: Span; turnId: string }>();
 
   constructor(
     queueId: string | null,
@@ -84,6 +93,14 @@ export class CodexEventProcessor implements EventProcessor {
     }
     if (event.eventName === USER_PROMPT_SUBMIT) {
       this.startTurnSpan(event);
+      return;
+    }
+    if (event.eventName === PRE_TOOL_USE) {
+      this.startToolSpan(event);
+      return;
+    }
+    if (event.eventName === POST_TOOL_USE) {
+      this.endToolSpan(event);
       return;
     }
     if (event.eventName === STOP) {
@@ -204,6 +221,143 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
+  // Open a child span for a tool call on PreToolUse, parented to the turn span
+  // matching turn_id. Keyed by tool_use_id so the matching PostToolUse can close
+  // it. The tool_input is the span's input. If the turn span isn't open (which
+  // shouldn't happen — tool calls always occur within a turn) or there's no
+  // tool_use_id to pair on, we log a warning and skip rather than guess a parent.
+  private startToolSpan(event: EnqueueEvent): void {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
+    const toolUseId = typeof data.tool_use_id === "string" ? data.tool_use_id : undefined;
+    const toolName = typeof data.tool_name === "string" ? data.tool_name : undefined;
+    const toolInput = data.tool_input;
+
+    if (toolUseId === undefined) {
+      this.logger.warn("codex processor: PreToolUse without tool_use_id; skipping tool span", {
+        queueId: this.queueId,
+        turnId,
+      });
+      return;
+    }
+
+    if (turnId === undefined) {
+      this.logger.warn("codex processor: PreToolUse without turn_id; skipping tool span", {
+        queueId: this.queueId,
+        toolUseId,
+      });
+      return;
+    }
+
+    const turnSpan = this.openTurns.get(turnId);
+    if (turnSpan === undefined) {
+      this.logger.warn("codex processor: PreToolUse with no open turn span; skipping tool span", {
+        queueId: this.queueId,
+        turnId,
+        toolUseId,
+      });
+      return;
+    }
+
+    if (this.openTools.has(toolUseId)) {
+      this.logger.warn("codex processor: duplicate tool_use_id; keeping existing tool span", {
+        queueId: this.queueId,
+        toolUseId,
+      });
+      return;
+    }
+
+    try {
+      const toolSpan = turnSpan.startSpan({
+        name: toolName ?? "tool",
+        type: "tool",
+        event: {
+          input: toolInput,
+          metadata: { tool_name: toolName, tool_use_id: toolUseId, turn_id: turnId },
+        },
+      });
+      this.openTools.set(toolUseId, { span: toolSpan, turnId });
+      this.logger.info("codex processor: opened tool span", {
+        queueId: this.queueId,
+        turnId,
+        toolUseId,
+        spanId: toolSpan.id,
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to open tool span", {
+        queueId: this.queueId,
+        turnId,
+        toolUseId,
+        error: String(err),
+      });
+    }
+  }
+
+  // Close the tool span matching the PostToolUse's tool_use_id, recording the
+  // tool_response as the span's output.
+  private endToolSpan(event: EnqueueEvent): void {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const toolUseId = typeof data.tool_use_id === "string" ? data.tool_use_id : undefined;
+    const output = data.tool_response;
+
+    if (toolUseId === undefined) {
+      this.logger.debug("codex processor: PostToolUse without tool_use_id; no tool span to close", {
+        queueId: this.queueId,
+      });
+      return;
+    }
+
+    const entry = this.openTools.get(toolUseId);
+    if (entry === undefined) {
+      this.logger.debug("codex processor: PostToolUse with no open tool span", {
+        queueId: this.queueId,
+        toolUseId,
+      });
+      return;
+    }
+
+    try {
+      entry.span.log({ output });
+      entry.span.end();
+      this.logger.info("codex processor: ended tool span", { queueId: this.queueId, toolUseId });
+    } catch (err) {
+      this.logger.error("codex processor: failed to end tool span", {
+        queueId: this.queueId,
+        toolUseId,
+        error: String(err),
+      });
+    } finally {
+      this.openTools.delete(toolUseId);
+    }
+  }
+
+  // End (without output) any still-open tool spans owned by the given turn. A
+  // tool span can be left open when its PostToolUse never arrives (e.g. the call
+  // was interrupted by a permission prompt and re-issued under a new
+  // tool_use_id). Called when the turn ends so dangling tool spans get closed.
+  private endOpenToolSpansForTurn(turnId: string): void {
+    for (const [toolUseId, entry] of this.openTools) {
+      if (entry.turnId !== turnId) continue;
+      try {
+        entry.span.end();
+        this.logger.info("codex processor: ended dangling tool span on turn end", {
+          queueId: this.queueId,
+          turnId,
+          toolUseId,
+        });
+      } catch (err) {
+        this.logger.error("codex processor: failed to end dangling tool span", {
+          queueId: this.queueId,
+          turnId,
+          toolUseId,
+          error: String(err),
+        });
+      } finally {
+        this.openTools.delete(toolUseId);
+      }
+    }
+  }
+
   // Close the turn span matching the Stop's turn_id, recording the final
   // assistant message as the span's output.
   private endTurnSpan(event: EnqueueEvent): void {
@@ -228,6 +382,9 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
 
+    // Close any tool spans still open under this turn before ending the turn.
+    this.endOpenToolSpansForTurn(turnId);
+
     try {
       turnSpan.log({ output });
       turnSpan.end();
@@ -248,6 +405,20 @@ export class CodexEventProcessor implements EventProcessor {
   private endRootSpan(): void {
     if (this.rootSpan === null || this.rootEnded) return;
     this.rootEnded = true;
+    // Backstop: close any tool spans still open (e.g. ones whose turn never saw
+    // a matching Stop) so nothing is left dangling when the session ends.
+    for (const [toolUseId, entry] of this.openTools) {
+      try {
+        entry.span.end();
+      } catch (err) {
+        this.logger.error("codex processor: failed to end dangling tool span on root end", {
+          queueId: this.queueId,
+          toolUseId,
+          error: String(err),
+        });
+      }
+    }
+    this.openTools.clear();
     try {
       this.rootSpan.end();
       this.logger.info("codex processor: ended root span", { queueId: this.queueId });
