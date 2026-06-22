@@ -153,12 +153,27 @@ interface ChatMessage {
   tool_call_id?: string;
 }
 
+/**
+ * A reasoning ("thinking") item, in the OpenAI Responses shape Braintrust
+ * renders. `summary` is the readable reasoning text the model exposes (Codex
+ * records it on `reasoning` transcript items as `summary_text` entries; the full
+ * chain-of-thought itself is encrypted and not available). Interleaved with chat
+ * messages in an LLM call's output and in the conversation history.
+ */
+interface ReasoningItem {
+  type: "reasoning";
+  summary: Array<{ type: "summary_text"; text: string }>;
+}
+
+/** An item in an LLM call's output or the conversation history. */
+type ConversationItem = ChatMessage | ReasoningItem;
+
 /** State for the LLM span currently in progress (one model call). */
 interface OpenLlm {
   span: Span;
   turnId: string | undefined;
-  /** Assistant messages produced by this call (text and/or tool calls). */
-  output: ChatMessage[];
+  /** Items produced by this call: reasoning, assistant text, and/or tool calls. */
+  output: ConversationItem[];
   /**
    * When true, the span's output was already set at creation (e.g. a compaction
    * call, whose output is the replacement history), so closing it must not
@@ -192,8 +207,9 @@ interface TranscriptScope {
   readonly openTurns: Map<string, Span>;
   /** turn_ids whose Stop has fired but whose task_complete hasn't been seen. */
   readonly turnsAwaitingCompletion: Set<string>;
-  /** OpenAI-style chat history, used to reconstruct each LLM call's input. */
-  readonly conversationHistory: ChatMessage[];
+  /** OpenAI-style chat history (messages + reasoning), used to reconstruct each
+   * LLM call's input. */
+  readonly conversationHistory: ConversationItem[];
   /** The currently-open LLM span in this scope, if a model call is in progress. */
   openLlm: OpenLlm | null;
   /** Tool spans currently open in this scope, keyed by call_id. */
@@ -238,9 +254,31 @@ function tokenMetrics(usage: Record<string, unknown>): Record<string, number> {
  * assistant message or an array of messages as a chat completion; a single
  * message is returned directly, multiple are returned as an array.
  */
-function llmOutput(messages: ChatMessage[]): unknown {
+function llmOutput(messages: ConversationItem[]): unknown {
   if (messages.length === 1) return messages[0];
   return messages;
+}
+
+/**
+ * Extract the readable reasoning summary from a `reasoning` item's `summary`
+ * field: a list of `{type: "summary_text", text}` entries. Returns the
+ * non-empty entries (matching Braintrust's reasoning shape), or undefined when
+ * there's nothing readable (the full reasoning is encrypted and not exposed).
+ */
+function reasoningSummary(
+  summary: unknown,
+): Array<{ type: "summary_text"; text: string }> | undefined {
+  if (!Array.isArray(summary)) return undefined;
+  const parts: Array<{ type: "summary_text"; text: string }> = [];
+  for (const entry of summary) {
+    if (entry && typeof entry === "object") {
+      const text = (entry as { text?: unknown }).text;
+      if (typeof text === "string" && text.length > 0) {
+        parts.push({ type: "summary_text", text });
+      }
+    }
+  }
+  return parts.length > 0 ? parts : undefined;
 }
 
 /** Extract the concatenated text from a response_item message's content array. */
@@ -1244,11 +1282,19 @@ export class CodexEventProcessor implements EventProcessor {
     scope.conversationHistory.push(msg);
   }
 
-  // Handle a reasoning item: it belongs to the current model call but its raw
-  // content is encrypted/opaque, so we only use it to ensure the LLM span is
-  // open. (No readable text to surface here.)
+  // Handle a reasoning item: it belongs to the current model call. Open the LLM
+  // span and, when the model exposed a readable reasoning summary, surface it as
+  // a `reasoning` item in the call's output and in the conversation history (so
+  // subsequent calls' input shows the prior thinking too). The full reasoning is
+  // encrypted, so items with no readable summary only open the span.
   private handleReasoningItem(scope: TranscriptScope, record: TranscriptRecord): void {
     this.ensureLlmSpan(scope, record);
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    const summary = reasoningSummary(payload.summary);
+    if (summary === undefined) return;
+    const item: ReasoningItem = { type: "reasoning", summary };
+    scope.openLlm?.output.push(item);
+    scope.conversationHistory.push(item);
   }
 
   // Close the current LLM call on a token_count (the segment boundary): end the

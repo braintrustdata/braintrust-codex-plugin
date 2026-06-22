@@ -207,11 +207,20 @@ export function userMessageItem(text: string): TranscriptEntry {
   return message("user", text);
 }
 
-/** reasoning response_item; pass summary strings to surface reasoning text. */
+/**
+ * reasoning response_item. Pass summary strings to surface readable reasoning
+ * ("thinking"); they're wrapped in Codex's real `{type:"summary_text", text}`
+ * shape. With no strings, only `encrypted_content` is present (the common case),
+ * so nothing readable is surfaced.
+ */
 export function reasoning(summary: string[] = []): TranscriptEntry {
   return transcript({
     type: "response_item",
-    payload: { type: "reasoning", summary, encrypted_content: "opaque" },
+    payload: {
+      type: "reasoning",
+      summary: summary.map((text) => ({ type: "summary_text", text })),
+      encrypted_content: "opaque",
+    },
   });
 }
 

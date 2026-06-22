@@ -903,6 +903,85 @@ describe("CodexEventProcessor: llm spans", () => {
     );
   });
 
+  // A reasoning item with a readable summary is surfaced as a `reasoning` entry
+  // in the llm output (Braintrust's OpenAI Responses shape), interleaved before
+  // the assistant message.
+  test("a reasoning summary is captured as a reasoning item in the llm output", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessageItem("solve it"),
+        reasoning(["**Inspecting the problem**", "**Deriving the formula**"]),
+        assistantMessage("The answer is 42."),
+        tokenCount({ input_tokens: 10, output_tokens: 5, total_tokens: 15 }),
+        taskComplete({ turn_id: "t1", last_agent_message: "The answer is 42." }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: [
+                  {
+                    type: "reasoning",
+                    summary: [
+                      { type: "summary_text", text: "**Inspecting the problem**" },
+                      { type: "summary_text", text: "**Deriving the formula**" },
+                    ],
+                  },
+                  { role: "assistant", content: "The answer is 42." },
+                ],
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // A reasoning item with only encrypted content (no readable summary) opens the
+  // llm span but adds nothing to the output.
+  test("an encrypted-only reasoning item adds no reasoning to the output", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessageItem("hi"),
+        reasoning(), // no summary
+        assistantMessage("Hello."),
+        tokenCount({ total_tokens: 5 }),
+        taskComplete({ turn_id: "t1", last_agent_message: "Hello." }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                // Single assistant message only — no reasoning entry.
+                output: { role: "assistant", content: "Hello." },
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
   test("llm input is reconstructed from prior conversation messages", async () => {
     await assertProducesTrace(
       [
