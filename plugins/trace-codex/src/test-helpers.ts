@@ -85,7 +85,7 @@ export interface CapturedSpan {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
-  metrics?: { start?: number; end?: number };
+  metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
 }
 
 export interface CapturedTrace {
@@ -131,7 +131,7 @@ export interface SpanTree {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
-  metrics?: { start?: number; end?: number };
+  metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
   children: SpanTree[];
 }
 
@@ -191,7 +191,7 @@ export interface ExpectedSpan {
   /** If set, assert whether the span has an end time (true) or not (false). */
   ended?: boolean;
   /** If set, assert exact start/end metric values (Unix seconds). */
-  metrics?: { start?: number; end?: number };
+  metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
   /** Exact list of children (length and order are checked). */
   children?: ExpectedSpan[];
 }
@@ -247,15 +247,12 @@ export function diffSpan(actual: SpanTree | null, expected: ExpectedSpan, path: 
     }
   }
   if (expected.metrics !== undefined) {
-    if (expected.metrics.start !== undefined && actual.metrics?.start !== expected.metrics.start) {
-      diffs.push(
-        `${path}.metrics.start: expected ${expected.metrics.start}, got ${String(actual.metrics?.start)}`,
-      );
-    }
-    if (expected.metrics.end !== undefined && actual.metrics?.end !== expected.metrics.end) {
-      diffs.push(
-        `${path}.metrics.end: expected ${expected.metrics.end}, got ${String(actual.metrics?.end)}`,
-      );
+    for (const [key, value] of Object.entries(expected.metrics)) {
+      if (value === undefined) continue;
+      const actualValue = actual.metrics?.[key];
+      if (actualValue !== value) {
+        diffs.push(`${path}.metrics.${key}: expected ${value}, got ${String(actualValue)}`);
+      }
     }
   }
   if (expected.children !== undefined) {

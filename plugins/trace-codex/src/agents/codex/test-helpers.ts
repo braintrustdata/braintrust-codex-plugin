@@ -164,6 +164,44 @@ export function customToolCallOutput(payload: Record<string, unknown> = {}): Tra
   });
 }
 
+/** A message response_item with the given role and text. */
+export function message(role: string, text: string): TranscriptEntry {
+  const itemType = role === "assistant" ? "output_text" : "input_text";
+  return transcript({
+    type: "response_item",
+    payload: { type: "message", role, content: [{ type: itemType, text }] },
+  });
+}
+
+/** assistant message response_item (model output; opens/feeds an llm span). */
+export function assistantMessage(text: string): TranscriptEntry {
+  return message("assistant", text);
+}
+
+/** user message response_item (input context). */
+export function userMessageItem(text: string): TranscriptEntry {
+  return message("user", text);
+}
+
+/** reasoning response_item; pass summary strings to surface reasoning text. */
+export function reasoning(summary: string[] = []): TranscriptEntry {
+  return transcript({
+    type: "response_item",
+    payload: { type: "reasoning", summary, encrypted_content: "opaque" },
+  });
+}
+
+/**
+ * token_count event: closes the current llm span. `usage` maps the Codex token
+ * keys (input_tokens, output_tokens, total_tokens, ...) onto last_token_usage.
+ */
+export function tokenCount(usage: Record<string, number> = {}): TranscriptEntry {
+  return transcript({
+    type: "event_msg",
+    payload: { type: "token_count", info: { last_token_usage: usage } },
+  });
+}
+
 /** One entry in a mixed trace list: a hook event or a transcript write. */
 export type TraceEntry = EnqueueEvent | TranscriptEntry;
 

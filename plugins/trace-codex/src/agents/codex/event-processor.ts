@@ -38,11 +38,14 @@ import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
 import {
   EVT_TASK_COMPLETE,
   EVT_TASK_STARTED,
+  EVT_TOKEN_COUNT,
   EVT_USER_MESSAGE,
   ITEM_CUSTOM_TOOL_CALL,
   ITEM_CUSTOM_TOOL_CALL_OUTPUT,
   ITEM_FUNCTION_CALL,
   ITEM_FUNCTION_CALL_OUTPUT,
+  ITEM_MESSAGE,
+  ITEM_REASONING,
   ITEM_TOOL_SEARCH_CALL,
   ITEM_TOOL_SEARCH_OUTPUT,
   parseTranscriptLine,
@@ -109,6 +112,72 @@ interface RootEnrichment {
   permissionMode?: string;
 }
 
+/**
+ * An OpenAI-style chat message. Used to reconstruct each LLM call's input (the
+ * transcript does not log the literal request) and to shape its output, so
+ * Braintrust renders these spans as proper LLM calls. Tool calls become an
+ * assistant message with `tool_calls`; tool results become a `tool` message.
+ */
+interface ChatMessage {
+  role: "developer" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
+}
+
+/** State for the LLM span currently in progress (one model call). */
+interface OpenLlm {
+  span: Span;
+  turnId: string | undefined;
+  /** Assistant messages produced by this call (text and/or tool calls). */
+  output: ChatMessage[];
+}
+
+/** Map Codex token usage keys onto Braintrust's standard metric names. */
+function tokenMetrics(usage: Record<string, unknown>): Record<string, number> {
+  const metrics: Record<string, number> = {};
+  const num = (v: unknown): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) ? v : undefined;
+  const map: Array<[string, string]> = [
+    ["input_tokens", "prompt_tokens"],
+    ["output_tokens", "completion_tokens"],
+    ["total_tokens", "tokens"],
+    ["cached_input_tokens", "prompt_cached_tokens"],
+    ["reasoning_output_tokens", "completion_reasoning_tokens"],
+  ];
+  for (const [from, to] of map) {
+    const v = num(usage[from]);
+    if (v !== undefined) metrics[to] = v;
+  }
+  return metrics;
+}
+
+/**
+ * Shape an LLM call's output for Braintrust. Braintrust renders a single
+ * assistant message or an array of messages as a chat completion; a single
+ * message is returned directly, multiple are returned as an array.
+ */
+function llmOutput(messages: ChatMessage[]): unknown {
+  if (messages.length === 1) return messages[0];
+  return messages;
+}
+
+/** Extract the concatenated text from a response_item message's content array. */
+function messageText(content: unknown): string | undefined {
+  if (!Array.isArray(content)) return undefined;
+  const parts: string[] = [];
+  for (const part of content) {
+    if (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string") {
+      parts.push((part as { text: string }).text);
+    }
+  }
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
 export class CodexEventProcessor implements EventProcessor {
   private readonly logger: Logger;
   private readonly queueId: string | null;
@@ -126,9 +195,16 @@ export class CodexEventProcessor implements EventProcessor {
   // only blocks-and-polls when one of these is still open; a turn that is merely
   // mid-progress (no Stop yet) does not make an idle flush wait.
   private readonly turnsAwaitingCompletion = new Set<string>();
+  // Conversation history accumulated from transcript records (developer/user/
+  // assistant messages and tool calls/outputs), as OpenAI-style chat messages.
+  // The transcript does not log the outbound API request, so we reconstruct each
+  // LLM call's input as the history captured up to the moment its span opens.
+  private readonly conversationHistory: ChatMessage[] = [];
+  // The currently-open LLM span, if a model call is in progress. One LLM call =
+  // a run of reasoning/message (+ tool) items terminated by a token_count.
+  private openLlm: OpenLlm | null = null;
   // Tool spans currently open, keyed by call_id. Opened by a tool-call
-  // response_item and closed by the matching *_output. The owning turn_id is
-  // tracked so any still-open tool spans are ended when their turn ends.
+  // response_item and closed by the matching *_output; ordered by start time.
   private readonly openTools = new Map<string, { span: Span; turnId: string }>();
   // Root enrichment from the SessionStart hook (source/permission_mode), which
   // the transcript lacks. Applied when the root span is created, or patched onto
@@ -303,11 +379,14 @@ export class CodexEventProcessor implements EventProcessor {
         if (ptype === EVT_TASK_STARTED) this.startTurnSpan(record);
         else if (ptype === EVT_USER_MESSAGE) this.setTurnInput(record);
         else if (ptype === EVT_TASK_COMPLETE) this.endTurnSpan(record);
+        else if (ptype === EVT_TOKEN_COUNT) this.closeLlmSpan(record);
         return;
       }
       if (record.type === RECORD_RESPONSE_ITEM) {
         const ptype = record.payload?.type ?? "";
-        if (TOOL_CALL_TYPES.has(ptype)) this.startToolSpan(record);
+        if (ptype === ITEM_MESSAGE) this.handleMessageItem(record);
+        else if (ptype === ITEM_REASONING) this.handleReasoningItem(record);
+        else if (TOOL_CALL_TYPES.has(ptype)) this.startToolSpan(record);
         else if (TOOL_OUTPUT_TYPES.has(ptype)) this.endToolSpan(record);
         return;
       }
@@ -504,6 +583,10 @@ export class CodexEventProcessor implements EventProcessor {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const prompt = typeof payload.message === "string" ? payload.message : undefined;
     if (prompt === undefined) return;
+    // Note: we do NOT add the prompt to conversationHistory here — the same
+    // prompt also arrives as a response_item user message (handleMessageItem),
+    // which is the canonical source for history. This event only sets the turn's
+    // input for display.
     const turnSpan = this.latestOpenTurn();
     if (turnSpan === undefined) {
       this.logger.debug("codex processor: user_message with no open turn span", {
@@ -543,6 +626,10 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
     const endTime = isoToUnixSeconds(record.timestamp);
+    // Backstop: close any spans still open without their own closing record
+    // (a trailing model call with no token_count, or a tool with no output) at
+    // the turn's end time.
+    this.endOpenLlmSpan(endTime);
     this.endOpenToolSpansForTurn(turnId, endTime);
     try {
       turnSpan.log({ output });
@@ -561,17 +648,154 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
-  // Open a tool span (child of its turn) for a tool-call response_item. Keyed by
-  // call_id so the matching *_output can close it. Skipped (with a warning) when
-  // there's no call_id or no open turn for its metadata.turn_id.
+  // ==========================================================================
+  // LLM spans (transcript-driven)
+  //
+  // One LLM call = a run of reasoning/message (+ tool) items terminated by a
+  // token_count. The span opens lazily on the first model-output item (assistant
+  // message or reasoning) and closes at the next token_count, which carries the
+  // call's token usage. Tool calls the model emits are sibling tool spans under
+  // the turn (handled elsewhere); the assistant text/reasoning is the LLM span's
+  // output, and its input is the conversation reconstructed up to the open.
+  // ==========================================================================
+
+  // Ensure an LLM span is open for the current model call, opening one (child of
+  // the active turn) on first use with input = the conversation so far.
+  private ensureLlmSpan(record: TranscriptRecord): void {
+    if (this.openLlm !== null) return;
+    const turnSpan = this.latestOpenTurn();
+    if (turnSpan === undefined) {
+      this.logger.debug("codex processor: model output with no open turn; skipping llm span", {
+        queueId: this.queueId,
+      });
+      return;
+    }
+    const turnId = this.latestOpenTurnId();
+    const startTime = isoToUnixSeconds(record.timestamp);
+    // Snapshot the conversation as this call's input (the transcript doesn't log
+    // the real request, so this is a best-effort reconstruction).
+    const input = this.conversationHistory.map((item) => ({ ...item }));
+    try {
+      const span = turnSpan.startSpan({
+        name: this.model ?? "llm",
+        type: "llm",
+        ...(startTime !== undefined ? { startTime } : {}),
+        event: { input, metadata: { model: this.model, turn_id: turnId } },
+      });
+      this.openLlm = { span, turnId, output: [] };
+      this.logger.info("codex processor: opened llm span", {
+        queueId: this.queueId,
+        turnId,
+        spanId: span.id,
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to open llm span", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    }
+  }
+
+  // Handle a response_item message: an assistant message is this call's output
+  // (opens/feeds the LLM span); user/developer messages are input context. All
+  // are appended to conversation history as chat messages for reconstructing
+  // later calls' inputs.
+  private handleMessageItem(record: TranscriptRecord): void {
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    const rawRole = typeof payload.role === "string" ? payload.role : "user";
+    const role: ChatMessage["role"] =
+      rawRole === "assistant" || rawRole === "developer" || rawRole === "tool" ? rawRole : "user";
+    const text = messageText(payload.content);
+    if (text === undefined) return;
+
+    const msg: ChatMessage = { role, content: text };
+    if (role === "assistant") {
+      this.ensureLlmSpan(record);
+      this.openLlm?.output.push(msg);
+    }
+    this.conversationHistory.push(msg);
+  }
+
+  // Handle a reasoning item: it belongs to the current model call but its raw
+  // content is encrypted/opaque, so we only use it to ensure the LLM span is
+  // open. (No readable text to surface here.)
+  private handleReasoningItem(record: TranscriptRecord): void {
+    this.ensureLlmSpan(record);
+  }
+
+  // Close the current LLM call on a token_count (the segment boundary): end the
+  // LLM span with token-usage metrics and its accumulated output. (Tool spans
+  // are opened/closed by their own records, so nothing to flush here.)
+  private closeLlmSpan(record: TranscriptRecord): void {
+    if (this.openLlm === null) return;
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    const info = (payload.info ?? {}) as Record<string, unknown>;
+    const usage = (info.last_token_usage ?? {}) as Record<string, unknown>;
+    const metrics = tokenMetrics(usage);
+    const endTime = isoToUnixSeconds(record.timestamp);
+    const { span, output } = this.openLlm;
+    try {
+      span.log({ output: llmOutput(output), metrics });
+      span.end(endTime !== undefined ? { endTime } : undefined);
+      this.logger.info("codex processor: ended llm span", { queueId: this.queueId });
+    } catch (err) {
+      this.logger.error("codex processor: failed to end llm span", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    } finally {
+      this.openLlm = null;
+    }
+  }
+
+  // End any open LLM span without a closing token_count (e.g. on turn/root end).
+  private endOpenLlmSpan(endTime: number | undefined): void {
+    if (this.openLlm === null) return;
+    const { span, output } = this.openLlm;
+    try {
+      if (output.length > 0) span.log({ output: llmOutput(output) });
+      span.end(endTime !== undefined ? { endTime } : undefined);
+    } catch (err) {
+      this.logger.error("codex processor: failed to end dangling llm span", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    } finally {
+      this.openLlm = null;
+    }
+  }
+
+  // Open a tool span (child of its turn) for a tool-call response_item, keyed by
+  // call_id so the matching *_output can close it. Each tool span is opened and
+  // closed by its own records (no cross-segment buffering), which keeps it robust
+  // against the transcript being read in pieces. Tool spans are ordered by their
+  // transcript start time, so they render between the LLM calls around them.
   private startToolSpan(record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
     const name = typeof payload.name === "string" ? payload.name : undefined;
     const meta = (payload.metadata ?? {}) as Record<string, unknown>;
-    const turnId = typeof meta.turn_id === "string" ? meta.turn_id : undefined;
+    const turnId = typeof meta.turn_id === "string" ? meta.turn_id : this.latestOpenTurnId();
     // function_call uses `arguments` (a JSON string); custom_tool_call uses `input`.
     const input = payload.arguments ?? payload.input;
+
+    // A tool call is part of the assistant's response: record it as an assistant
+    // message carrying a tool_call, both in the open LLM call's output and in the
+    // conversation history (input context for later calls).
+    const argsString = typeof input === "string" ? input : JSON.stringify(input ?? {});
+    const toolCallMsg: ChatMessage = {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        {
+          id: callId ?? "",
+          type: "function",
+          function: { name: name ?? "tool", arguments: argsString },
+        },
+      ],
+    };
+    this.openLlm?.output.push(toolCallMsg);
+    this.conversationHistory.push(toolCallMsg);
 
     if (callId === undefined) {
       this.logger.warn("codex processor: tool call without call_id; skipping tool span", {
@@ -632,11 +856,16 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // Close the tool span matching a *_output record's call_id, recording the
-  // output.
+  // output, and add the result to conversation history as a `tool` message.
   private endToolSpan(record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
     const output = payload.output ?? payload.result;
+    this.conversationHistory.push({
+      role: "tool",
+      content: typeof output === "string" ? output : JSON.stringify(output ?? null),
+      tool_call_id: callId ?? "",
+    });
     if (callId === undefined) {
       this.logger.debug("codex processor: tool output without call_id", {
         queueId: this.queueId,
@@ -668,18 +897,12 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // End any still-open tool spans owned by the given turn (e.g. a call whose
-  // output never arrived) when the turn ends. Uses the turn's end time so a
-  // dangling tool span doesn't get a wall-clock end far in the future.
+  // output never arrived) when the turn ends, at the turn's end time.
   private endOpenToolSpansForTurn(turnId: string, endTime: number | undefined): void {
     for (const [callId, entry] of this.openTools) {
       if (entry.turnId !== turnId) continue;
       try {
         entry.span.end(endTime !== undefined ? { endTime } : undefined);
-        this.logger.info("codex processor: ended dangling tool span on turn end", {
-          queueId: this.queueId,
-          turnId,
-          callId,
-        });
       } catch (err) {
         this.logger.error("codex processor: failed to end dangling tool span", {
           queueId: this.queueId,
@@ -694,10 +917,17 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // The most recently opened turn that is still open (used to attach a
-  // user_message, which carries no turn_id).
+  // user_message or an LLM span, which carry no turn_id).
   private latestOpenTurn(): Span | undefined {
     let last: Span | undefined;
     for (const span of this.openTurns.values()) last = span;
+    return last;
+  }
+
+  // The turn_id of the most recently opened still-open turn.
+  private latestOpenTurnId(): string | undefined {
+    let last: string | undefined;
+    for (const turnId of this.openTurns.keys()) last = turnId;
     return last;
   }
 
@@ -720,7 +950,9 @@ export class CodexEventProcessor implements EventProcessor {
     if (this.rootSpan === null || this.rootEnded) return;
     this.rootEnded = true;
     const endArgs = endTime !== undefined ? { endTime } : undefined;
-    // Backstop: close any spans still open so nothing dangles.
+    // Backstop: close any open LLM span, any still-open tool spans, then any
+    // still-open turn spans, so nothing dangles.
+    this.endOpenLlmSpan(endTime);
     for (const [callId, entry] of this.openTools) {
       try {
         entry.span.end(endArgs);

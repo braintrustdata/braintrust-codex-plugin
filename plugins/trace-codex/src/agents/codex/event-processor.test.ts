@@ -6,20 +6,24 @@ import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
 import { CodexEventProcessor } from "./event-processor.ts";
 import {
   assertProducesTrace,
+  assistantMessage,
   configEvent,
   customToolCall,
   customToolCallOutput,
   FakeTranscriptReader,
   functionCall,
   functionCallOutput,
+  reasoning,
   sessionMeta,
   sessionStart,
   stop,
   taskComplete,
   taskStarted,
+  tokenCount,
   transcript,
   turnContext,
   userMessage,
+  userMessageItem,
 } from "./test-helpers.ts";
 import type {
   TranscriptReader,
@@ -246,8 +250,8 @@ describe("CodexEventProcessor: turn spans", () => {
 });
 
 describe("CodexEventProcessor: span timing (from transcript timestamps)", () => {
-  // 2026-01-01T00:00:10Z = 1767225610, :12Z = 1767225612, :15Z = 1767225615.
-  test("turn and tool spans get start/end from their transcript record timestamps", async () => {
+  // :10Z=1767225610, :11=...611, :12=...612, :13=...613, :14=...614, :15=...615.
+  test("llm and tool spans use their own transcript record timestamps", async () => {
     await assertProducesTrace(
       [
         sessionStart(),
@@ -261,9 +265,20 @@ describe("CodexEventProcessor: span timing (from transcript timestamps)", () => 
           timestamp: "2026-01-01T00:00:11Z",
           payload: { type: "task_started", turn_id: "t1" },
         }),
+        // LLM call: opens at the assistant message (:12), requests a tool (:13),
+        // result arrives (:14), and the call closes at token_count (:15).
         transcript({
           type: "response_item",
           timestamp: "2026-01-01T00:00:12Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "go" }],
+          },
+        }),
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:13Z",
           payload: {
             type: "function_call",
             name: "exec_command",
@@ -273,12 +288,17 @@ describe("CodexEventProcessor: span timing (from transcript timestamps)", () => 
         }),
         transcript({
           type: "response_item",
-          timestamp: "2026-01-01T00:00:13Z",
+          timestamp: "2026-01-01T00:00:14Z",
           payload: { type: "function_call_output", call_id: "c1", output: "ok" },
         }),
         transcript({
           type: "event_msg",
           timestamp: "2026-01-01T00:00:15Z",
+          payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 } } },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:16Z",
           payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" },
         }),
         stop({ turn_id: "t1" }),
@@ -286,17 +306,24 @@ describe("CodexEventProcessor: span timing (from transcript timestamps)", () => 
       {
         span_attributes: { name: "codex: work", type: "task" },
         ended: true,
-        // Root ends on first Stop at the turn's completion time.
-        metrics: { start: 1767225610, end: 1767225615 },
+        metrics: { start: 1767225610, end: 1767225616 },
         children: [
           {
             span_attributes: { name: "turn: t1", type: "task" },
-            metrics: { start: 1767225611, end: 1767225615 },
+            metrics: { start: 1767225611, end: 1767225616 },
             ended: true,
             children: [
               {
+                // LLM call: opened at the message (:12), closed at token_count (:15).
+                span_attributes: { name: "llm", type: "llm" },
+                metrics: { start: 1767225612, end: 1767225615 },
+                ended: true,
+              },
+              {
+                // Tool span uses its own record timestamps: function_call (:13)
+                // to function_call_output (:14). Ordered after the llm by start.
                 span_attributes: { name: "exec_command", type: "tool" },
-                metrics: { start: 1767225612, end: 1767225613 },
+                metrics: { start: 1767225613, end: 1767225614 },
                 ended: true,
               },
             ],
@@ -465,6 +492,171 @@ describe("CodexEventProcessor: tool spans", () => {
         ended: true,
         children: [
           { span_attributes: { name: "turn: t1", type: "task" }, ended: true, children: [] },
+        ],
+      },
+    );
+  });
+});
+
+describe("CodexEventProcessor: llm spans", () => {
+  test("a model call becomes an llm span (output + token metrics) under its turn", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "yo!" }),
+        reasoning(),
+        assistantMessage("Hey. What are we working on?"),
+        tokenCount({ input_tokens: 100, output_tokens: 14, total_tokens: 114 }),
+        taskComplete({ turn_id: "t1", last_agent_message: "Hey. What are we working on?" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: { role: "assistant", content: "Hey. What are we working on?" },
+                // Codex token keys mapped to Braintrust standard metric names.
+                metrics: { prompt_tokens: 100, completion_tokens: 14, tokens: 114 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("llm input is reconstructed from prior conversation messages", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        // The prompt arrives as a response_item user message (history source).
+        userMessageItem("yo!"),
+        assistantMessage("Hey."),
+        tokenCount({ input_tokens: 10, output_tokens: 2, total_tokens: 12 }),
+        taskComplete({ turn_id: "t1", last_agent_message: "Hey." }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                // Input = the user prompt seen before the call opened (chat msgs).
+                input: [{ role: "user", content: "yo!" }],
+                output: { role: "assistant", content: "Hey." },
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("multiple model calls interleave with tool spans in execution order", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "do it" }),
+        // First model call: asks for a tool.
+        assistantMessage("calling tool"),
+        functionCall({ turn_id: "t1", name: "exec_command", call_id: "c1" }),
+        tokenCount({ input_tokens: 10, output_tokens: 5, total_tokens: 15 }),
+        functionCallOutput({ call_id: "c1", output: "result" }),
+        // Second model call: final answer.
+        assistantMessage("done"),
+        tokenCount({ input_tokens: 20, output_tokens: 3, total_tokens: 23 }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            // Ordered siblings: llm(call 1), tool, llm(call 2).
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                // The call produced an assistant message plus a tool call.
+                output: [
+                  { role: "assistant", content: "calling tool" },
+                  {
+                    role: "assistant",
+                    content: null,
+                    tool_calls: [
+                      {
+                        id: "c1",
+                        type: "function",
+                        function: { name: "exec_command", arguments: "{}" },
+                      },
+                    ],
+                  },
+                ],
+                ended: true,
+              },
+              { span_attributes: { name: "exec_command", type: "tool" }, ended: true },
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: { role: "assistant", content: "done" },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("a model call with no closing token_count is closed when the turn ends", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "hi" }),
+        assistantMessage("partial"),
+        // No token_count; turn completes anyway.
+        taskComplete({ turn_id: "t1", last_agent_message: "partial" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: { role: "assistant", content: "partial" },
+                ended: true,
+              },
+            ],
+          },
         ],
       },
     );
