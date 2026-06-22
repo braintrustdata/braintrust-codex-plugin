@@ -85,6 +85,7 @@ export interface CapturedSpan {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
+  tags?: string[];
   metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
 }
 
@@ -131,6 +132,7 @@ export interface SpanTree {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
+  tags?: string[];
   metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
   children: SpanTree[];
 }
@@ -171,6 +173,7 @@ export function spansToTree(spans: CapturedSpan[]): SpanTree | null {
       input: span.input,
       output: span.output,
       metadata: span.metadata,
+      tags: span.tags,
       metrics: span.metrics,
       children,
     };
@@ -188,6 +191,8 @@ export interface ExpectedSpan {
   input?: unknown;
   output?: unknown;
   metadata?: Record<string, unknown>;
+  /** If set, assert each listed tag is present on the span. */
+  tags?: string[];
   /** If set, assert whether the span has an end time (true) or not (false). */
   ended?: boolean;
   /** If set, assert exact start/end metric values (Unix seconds). */
@@ -198,6 +203,23 @@ export interface ExpectedSpan {
 
 function nameMatches(actual: string | undefined, expected: string | RegExp): boolean {
   return expected instanceof RegExp ? expected.test(actual ?? "") : actual === expected;
+}
+
+/** JSON.stringify with object keys sorted recursively, for order-insensitive
+ * deep equality of plain data (objects/arrays/primitives). */
+function canonicalJson(value: unknown): string {
+  const sort = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.map(sort);
+    if (v !== null && typeof v === "object") {
+      const out: Record<string, unknown> = {};
+      for (const key of Object.keys(v as Record<string, unknown>).sort()) {
+        out[key] = sort((v as Record<string, unknown>)[key]);
+      }
+      return out;
+    }
+    return v;
+  };
+  return JSON.stringify(sort(value));
 }
 
 export function diffSpan(actual: SpanTree | null, expected: ExpectedSpan, path: string): string[] {
@@ -235,9 +257,20 @@ export function diffSpan(actual: SpanTree | null, expected: ExpectedSpan, path: 
   }
   if (expected.metadata !== undefined) {
     for (const [key, value] of Object.entries(expected.metadata)) {
-      const a = JSON.stringify(actual.metadata?.[key]);
-      const e = JSON.stringify(value);
+      // Compare with sorted keys so nested-object key order doesn't matter (the
+      // SDK may reorder keys, e.g. when metadata is merged across log() calls).
+      const a = canonicalJson(actual.metadata?.[key]);
+      const e = canonicalJson(value);
       if (a !== e) diffs.push(`${path}.metadata.${key}: expected ${e}, got ${a}`);
+    }
+  }
+  if (expected.tags !== undefined) {
+    for (const tag of expected.tags) {
+      if (!actual.tags?.includes(tag)) {
+        diffs.push(
+          `${path}.tags: expected to include "${tag}", got ${JSON.stringify(actual.tags)}`,
+        );
+      }
     }
   }
   if (expected.ended !== undefined) {

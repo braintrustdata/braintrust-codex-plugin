@@ -71,6 +71,14 @@ export function preToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
   return codexHook("PreToolUse", { session_id: "session-1", ...data });
 }
 
+export function preCompact(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("PreCompact", { session_id: "session-1", ...data });
+}
+
+export function postCompact(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("PostCompact", { session_id: "session-1", ...data });
+}
+
 export function postToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
   return codexHook("PostToolUse", { session_id: "session-1", ...data });
 }
@@ -216,6 +224,14 @@ export function tokenCount(usage: Record<string, number> = {}): TranscriptEntry 
     type: "event_msg",
     payload: { type: "token_count", info: { last_token_usage: usage } },
   });
+}
+
+/**
+ * compacted record: marks the current turn as a context compaction.
+ * `replacement_history` is the summarized history that replaces prior context.
+ */
+export function compacted(payload: Record<string, unknown> = {}): TranscriptEntry {
+  return transcript({ type: "compacted", payload });
 }
 
 /** One entry in a mixed trace list: a hook event or a transcript write. */

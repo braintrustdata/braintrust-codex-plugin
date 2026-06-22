@@ -7,6 +7,7 @@ import { CodexEventProcessor } from "./event-processor.ts";
 import {
   assertProducesTrace,
   assistantMessage,
+  compacted,
   configEvent,
   customToolCall,
   customToolCallOutput,
@@ -14,7 +15,9 @@ import {
   functionCall,
   functionCallOutput,
   MultiFileTranscriptReader,
+  postCompact,
   postToolUse,
+  preCompact,
   preToolUse,
   reasoning,
   sessionMeta,
@@ -500,6 +503,360 @@ describe("CodexEventProcessor: tool spans", () => {
         ],
       },
     );
+  });
+});
+
+describe("CodexEventProcessor: permissions", () => {
+  test("an escalated tool call is annotated with permission metadata and a tag", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "c1",
+          arguments: JSON.stringify({
+            cmd: "curl example.com",
+            sandbox_permissions: "require_escalated",
+            justification: "Need network access",
+            prefix_rule: ["curl"],
+          }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "ok" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "exec_command", type: "tool" },
+                metadata: {
+                  permission: {
+                    sandbox_permissions: "require_escalated",
+                    justification: "Need network access",
+                    prefix_rule: ["curl"],
+                  },
+                },
+                tags: ["permission-request"],
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // An escalation is a failed sandboxed attempt followed by an escalated retry.
+  // Both are separate tool spans (distinct call_ids); only the retry carries the
+  // permission annotation.
+  test("a sandboxed attempt then escalated retry: only the retry is annotated", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "attempt",
+          arguments: JSON.stringify({ cmd: "curl example.com" }),
+        }),
+        functionCallOutput({ call_id: "attempt", output: "Error: network blocked" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "retry",
+          arguments: JSON.stringify({
+            cmd: "curl example.com",
+            sandbox_permissions: "require_escalated",
+            justification: "Need network access",
+          }),
+        }),
+        functionCallOutput({ call_id: "retry", output: "ok" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                // The failed sandboxed attempt: no permission annotation.
+                span_attributes: { name: "exec_command", type: "tool" },
+                metadata: { call_id: "attempt", permission: undefined },
+                output: "Error: network blocked",
+                ended: true,
+              },
+              {
+                // The escalated retry: annotated.
+                span_attributes: { name: "exec_command", type: "tool" },
+                metadata: {
+                  call_id: "retry",
+                  permission: {
+                    sandbox_permissions: "require_escalated",
+                    justification: "Need network access",
+                  },
+                },
+                tags: ["permission-request"],
+                output: "ok",
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("a non-escalated tool call has no permission metadata or tag", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "c1",
+          arguments: JSON.stringify({ cmd: "ls" }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "file.txt" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "exec_command", type: "tool" },
+                metadata: { permission: undefined },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+});
+
+describe("CodexEventProcessor: compaction", () => {
+  // A compaction is its own turn containing a `compacted` record. That turn span
+  // is relabeled "compaction", tagged, annotated, and given an llm child span
+  // showing what the compaction did (input = prior history; output = the
+  // replacement history). The trigger comes from the compact hooks, and the turn
+  // is terminated by PostCompact (a compaction turn gets no Stop of its own).
+  test("a compaction turn becomes a compaction span with an llm child", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "tc" }),
+        preCompact({ turn_id: "tc", trigger: "manual" }),
+        compacted({
+          message: "",
+          replacement_history: [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+            { type: "compaction", encrypted_content: "opaque" },
+          ],
+          window_id: 1,
+        }),
+        tokenCount({ total_tokens: 6451 }),
+        taskComplete({ turn_id: "tc", last_agent_message: null }),
+        postCompact({ turn_id: "tc", trigger: "manual" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "compaction", type: "task" },
+            metadata: {
+              compaction: { trigger: "manual", replaced_message_count: 2, window_id: 1 },
+            },
+            tags: ["compaction"],
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                metadata: { compaction: true },
+                // Output is shaped as the kept context + a clear summary marker
+                // (the real summary is encrypted), not the raw replacement list.
+                output: {
+                  summary: "[summary unavailable — encrypted by Codex]",
+                  kept_messages: [
+                    {
+                      type: "message",
+                      role: "user",
+                      content: [{ type: "input_text", text: "hi" }],
+                    },
+                  ],
+                },
+                metrics: { tokens: 6451 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // The trigger must be captured whether the hook arrives before or after the
+  // transcript's compacted record. Here the hook comes AFTER (e.g. a resumed
+  // session whose compacted record is read during SessionStart's catch-up); the
+  // trigger is back-filled onto the already-built span.
+  test("trigger is back-filled when the compact hook arrives after the record", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "tc" }),
+        compacted({ replacement_history: [{ type: "compaction" }], window_id: 2 }),
+        tokenCount({ total_tokens: 10 }),
+        taskComplete({ turn_id: "tc", last_agent_message: null }),
+        // Stop processes the compacted record (trigger not yet known)...
+        stop({ turn_id: "tc" }),
+        // ...then the PostCompact hook reveals the trigger, back-filled onto the span.
+        postCompact({ turn_id: "tc", trigger: "auto" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "compaction", type: "task" },
+            metadata: {
+              compaction: { trigger: "auto", replaced_message_count: 1, window_id: 2 },
+            },
+            tags: ["compaction"],
+          },
+        ],
+      },
+    );
+  });
+
+  // Regression for the live bug: a compaction turn gets no Stop, and PostCompact
+  // fires BEFORE Codex writes the turn's task_complete. PostCompact must do the
+  // same bounded wait Stop does, so the compaction span closes within the hook
+  // instead of lingering open until idle eviction (where it may never flush).
+  test("PostCompact waits for a task_complete that lands after it, closing the span", async () => {
+    class DelayedRevealReader implements TranscriptReader {
+      private lines: string[] = [];
+      private withheld: string | null = null;
+      private readsUntilReveal = 0;
+
+      append(line: string): void {
+        this.lines.push(line);
+      }
+
+      withhold(line: string, afterReads: number): void {
+        this.withheld = line;
+        this.readsUntilReveal = afterReads;
+      }
+
+      readFrom(_path: string, offset: number): TranscriptReadResult {
+        if (this.withheld !== null) {
+          if (this.readsUntilReveal <= 0) {
+            this.lines.push(this.withheld);
+            this.withheld = null;
+          } else {
+            this.readsUntilReveal -= 1;
+          }
+        }
+        const buf = this.lines.length > 0 ? `${this.lines.join("\n")}\n` : "";
+        const from = offset > buf.length ? 0 : offset;
+        const slice = buf.slice(from);
+        const out: string[] = [];
+        let consumed = 0;
+        let lineStart = 0;
+        for (let i = 0; i < slice.length; i++) {
+          if (slice[i] === "\n") {
+            out.push(slice.slice(lineStart, i));
+            lineStart = i + 1;
+            consumed = lineStart;
+          }
+        }
+        return { lines: out, offset: from + consumed };
+      }
+
+      async waitFor(
+        path: string,
+        offset: number,
+        predicate: (line: string) => boolean,
+        _opts: WaitForOptions,
+      ): Promise<TranscriptWaitResult> {
+        const { lines, offset: next } = this.readFrom(path, offset);
+        return { lines, offset: next, sentinelFound: lines.some(predicate) };
+      }
+    }
+
+    const reader = new DelayedRevealReader();
+    const write = (record: Record<string, unknown>) =>
+      reader.append(JSON.stringify({ timestamp: "2026-01-01T00:00:10Z", ...record }));
+    write({ type: "session_meta", payload: { id: "s", cwd: "/work" } });
+    write({ type: "event_msg", payload: { type: "task_started", turn_id: "tc" } });
+    write({
+      timestamp: "2026-01-01T00:00:11Z",
+      type: "compacted",
+      payload: { replacement_history: [{ type: "compaction" }], window_id: 1 },
+    });
+    write({
+      timestamp: "2026-01-01T00:00:11Z",
+      type: "event_msg",
+      payload: { type: "token_count", info: { last_token_usage: {} } },
+    });
+    // task_complete is withheld until after PostCompact's initial read, so only
+    // its bounded waitFor reveals it.
+    reader.withhold(
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:15Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "tc", last_agent_message: null },
+      }),
+      1,
+    );
+
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+      await processor.process(configEvent({ session_id: "s" }));
+      await processor.process(sessionStart({ session_id: "s" }));
+      await processor.process(preCompact({ session_id: "s", turn_id: "tc", trigger: "manual" }));
+      // PostCompact's initial read won't see task_complete; its bounded wait must.
+      await processor.process(postCompact({ session_id: "s", turn_id: "tc", trigger: "manual" }));
+
+      const tree = spansToTree(await trace.drain());
+      const compaction = tree?.children.find((c) => c.name === "compaction");
+      expect(compaction).toBeDefined();
+      // The span closed within the hook (end time from the late task_complete).
+      expect(compaction?.metrics?.end).toBe(1767225615); // 2026-01-01T00:00:15Z
+    } finally {
+      trace.cleanup();
+    }
   });
 });
 

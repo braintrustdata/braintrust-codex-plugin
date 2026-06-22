@@ -49,6 +49,7 @@ import {
   ITEM_TOOL_SEARCH_CALL,
   ITEM_TOOL_SEARCH_OUTPUT,
   parseTranscriptLine,
+  RECORD_COMPACTED,
   RECORD_EVENT_MSG,
   RECORD_RESPONSE_ITEM,
   RECORD_SESSION_META,
@@ -62,7 +63,15 @@ const STOP = "Stop";
 const SUBAGENT_START = "SubagentStart";
 const SUBAGENT_STOP = "SubagentStop";
 const POST_TOOL_USE = "PostToolUse";
+const PRE_COMPACT = "PreCompact";
+const POST_COMPACT = "PostCompact";
 const SPAWN_AGENT_TOOL = "spawn_agent";
+// Tag applied to a tool span whose call requested escalated permissions, so
+// permission-gated actions are easy to find/filter in Braintrust.
+const PERMISSION_TAG = "permission-request";
+// Tag applied to a turn span that performed a context compaction, so compactions
+// are easy to find/filter in Braintrust.
+const COMPACTION_TAG = "compaction";
 
 // Bound on how long a Stop hook waits for the turn's task_complete to appear in
 // the transcript before giving up and emitting whatever exists. Codex can write
@@ -81,6 +90,17 @@ const FLUSH_TIMEOUT_MS = 15_000;
 const FLUSH_INTERVAL_MS = 50;
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Whether a hook signals the end of a turn (so we should wait, bounded, for the
+ * turn's task_complete to be written). Stop ends a normal turn; SubagentStop a
+ * subagent turn; PostCompact a compaction turn — which, unlike the others, never
+ * gets a Stop, so this is what lets its span close promptly instead of lingering
+ * open until idle eviction.
+ */
+function isTurnTerminal(eventName: string): boolean {
+  return eventName === STOP || eventName === SUBAGENT_STOP || eventName === POST_COMPACT;
+}
 
 /** Tool-call response_item subtypes that OPEN a tool span. */
 const TOOL_CALL_TYPES = new Set([ITEM_FUNCTION_CALL, ITEM_CUSTOM_TOOL_CALL, ITEM_TOOL_SEARCH_CALL]);
@@ -139,6 +159,12 @@ interface OpenLlm {
   turnId: string | undefined;
   /** Assistant messages produced by this call (text and/or tool calls). */
   output: ChatMessage[];
+  /**
+   * When true, the span's output was already set at creation (e.g. a compaction
+   * call, whose output is the replacement history), so closing it must not
+   * overwrite it with the accumulated `output` messages.
+   */
+  outputPreset?: boolean;
 }
 
 /**
@@ -229,6 +255,75 @@ function messageText(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join("") : undefined;
 }
 
+/**
+ * Shape a compaction's `replacement_history` into a readable "after compaction"
+ * output. The replacement history is the new context Codex keeps going forward:
+ * a few recent messages kept verbatim, plus a `compaction` entry holding the
+ * summary as `encrypted_content` (opaque to us). We surface the readable kept
+ * messages and replace the encrypted summary with a clear marker, so the span
+ * doesn't look like the model merely echoed the last user message.
+ */
+function compactionOutput(replacement: unknown[] | undefined): Record<string, unknown> {
+  if (replacement === undefined) {
+    return { summary: "[unavailable]", kept_messages: [] };
+  }
+  const kept: unknown[] = [];
+  let summaryEncrypted = false;
+  for (const entry of replacement) {
+    if (entry !== null && typeof entry === "object") {
+      const e = entry as Record<string, unknown>;
+      if (e.type === "compaction") {
+        if (typeof e.encrypted_content === "string") summaryEncrypted = true;
+        continue;
+      }
+    }
+    kept.push(entry);
+  }
+  return {
+    summary: summaryEncrypted ? "[summary unavailable — encrypted by Codex]" : "[no summary]",
+    kept_messages: kept,
+  };
+}
+
+/** A tool call's permission/escalation request, parsed from its arguments. */
+interface PermissionInfo {
+  /** The requested sandbox permission, e.g. "require_escalated". */
+  sandbox_permissions: string;
+  /** The model's justification shown to the user (may be absent). */
+  justification?: string;
+  /** The command prefix the escalation applies to (may be absent). */
+  prefix_rule?: unknown;
+}
+
+/**
+ * Parse a tool call's permission/escalation request from its arguments. Codex
+ * records an escalated retry's request inline in the function_call arguments
+ * (`sandbox_permissions`, `justification`, `prefix_rule`); when present, we
+ * surface it on the tool span. `args` is the raw arguments (a JSON string for
+ * function_call, or an object for custom_tool_call). Returns undefined when
+ * there's no escalation request.
+ */
+function permissionInfo(args: unknown): PermissionInfo | undefined {
+  let obj: Record<string, unknown> | undefined;
+  if (typeof args === "string") {
+    try {
+      const parsed = JSON.parse(args) as unknown;
+      if (parsed !== null && typeof parsed === "object") obj = parsed as Record<string, unknown>;
+    } catch {
+      return undefined;
+    }
+  } else if (args !== null && typeof args === "object") {
+    obj = args as Record<string, unknown>;
+  }
+  if (obj === undefined) return undefined;
+  const sandbox = obj.sandbox_permissions;
+  if (typeof sandbox !== "string" || sandbox.length === 0) return undefined;
+  const info: PermissionInfo = { sandbox_permissions: sandbox };
+  if (typeof obj.justification === "string") info.justification = obj.justification;
+  if (obj.prefix_rule !== undefined) info.prefix_rule = obj.prefix_rule;
+  return info;
+}
+
 export class CodexEventProcessor implements EventProcessor {
   private readonly logger: Logger;
   private readonly queueId: string | null;
@@ -260,6 +355,16 @@ export class CodexEventProcessor implements EventProcessor {
   // parent a subagent's root span under the spawning tool. Resolved from the
   // spawn_agent PostToolUse (agent_id + call_id) via spawnToolSpansByCallId.
   private readonly spawnToolSpansByAgentId = new Map<string, Span>();
+  // turn_id -> compaction trigger ("manual"/"auto"), recorded from the
+  // PreCompact/PostCompact hooks (the transcript's compacted record lacks the
+  // trigger). A side map so the hook and the transcript's compacted record can
+  // arrive in any order: whichever comes first stores its half here / below, and
+  // the second one reconciles. (On a resumed session the transcript's compacted
+  // record is read during SessionStart's catch-up, before the hook arrives.)
+  private readonly compactionTriggerByTurn = new Map<string, string>();
+  // turn_id -> the compaction span built from the transcript, kept so a later
+  // PreCompact/PostCompact hook can back-fill the trigger onto it.
+  private readonly compactionSpansByTurn = new Map<string, Span>();
 
   constructor(
     queueId: string | null,
@@ -312,6 +417,21 @@ export class CodexEventProcessor implements EventProcessor {
       this.recordRootEnrichment(event);
     }
 
+    // Compaction trigger is hook-only (not in the transcript). Record it keyed by
+    // turn_id, and if the compaction span was already built from the transcript
+    // (e.g. on a resumed session its compacted record is read during
+    // SessionStart's catch-up, before this hook arrives), back-fill the trigger
+    // onto it now. Order-independent: handleCompacted reads the map; this patches
+    // the span — whichever happens second reconciles.
+    if (event.eventName === PRE_COMPACT || event.eventName === POST_COMPACT) {
+      const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
+      const trigger = typeof data.trigger === "string" ? data.trigger : undefined;
+      if (turnId !== undefined && trigger !== undefined) {
+        this.compactionTriggerByTurn.set(turnId, trigger);
+        this.backfillCompactionTrigger(turnId, trigger);
+      }
+    }
+
     // A subagent is starting: open its root span (under the spawn_agent tool that
     // created it) and register a scope for its transcript so its hooks build a
     // full turn/llm/tool hierarchy inside that span.
@@ -323,9 +443,11 @@ export class CodexEventProcessor implements EventProcessor {
     // its transcript path, so each file keeps its own offset and open spans.
     const scope = this.scopeForEvent(event);
 
-    // A Stop signals its turn is finishing; mark it so flush knows to wait for
-    // this turn's task_complete (which Codex may write after the Stop hook).
-    if ((event.eventName === STOP || event.eventName === SUBAGENT_STOP) && scope !== null) {
+    // A turn-terminal signal: the turn is finishing, so mark it (flush, and the
+    // catch-up below, wait for this turn's task_complete, which Codex may write
+    // after the hook). Stop ends a normal turn; SubagentStop ends a subagent
+    // turn; PostCompact ends a compaction turn (which gets no Stop of its own).
+    if (isTurnTerminal(event.eventName) && scope !== null) {
       const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
       if (turnId !== undefined) scope.turnsAwaitingCompletion.add(turnId);
     }
@@ -366,11 +488,13 @@ export class CodexEventProcessor implements EventProcessor {
   // Read transcript lines appended to this scope's file since its last read and
   // turn each into spans. Never throws.
   //
-  // On a Stop/SubagentStop, first consume whatever's already on disk. If that
-  // closes the turn, we're done. Otherwise Codex hasn't written this turn's
-  // task_complete yet (it can lag the Stop hook by seconds), so wait (bounded)
-  // for it — but only then, so a Stop whose turn is already complete returns
-  // immediately.
+  // On a turn-terminal hook (Stop/SubagentStop/PostCompact), first consume
+  // whatever's already on disk. If that closes the turn, we're done. Otherwise
+  // Codex hasn't written this turn's task_complete yet (it can lag the hook by
+  // seconds), so wait (bounded) for it — but only then, so a hook whose turn is
+  // already complete returns immediately. PostCompact matters specifically
+  // because a compaction turn gets no Stop, so without this its span would stay
+  // open until idle eviction (and may never be flushed).
   private async catchUpScope(scope: TranscriptScope, event: EnqueueEvent): Promise<void> {
     const data = (event.eventData ?? {}) as Record<string, unknown>;
 
@@ -379,8 +503,7 @@ export class CodexEventProcessor implements EventProcessor {
     scope.offset = initial.offset;
     this.consumeLines(scope, initial.lines);
 
-    const isStop = event.eventName === STOP || event.eventName === SUBAGENT_STOP;
-    if (!isStop) return;
+    if (!isTurnTerminal(event.eventName)) return;
 
     const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
     // If the turn already closed during the initial read, no wait is needed.
@@ -396,8 +519,9 @@ export class CodexEventProcessor implements EventProcessor {
     scope.offset = result.offset;
     this.consumeLines(scope, result.lines);
     if (!result.sentinelFound) {
-      this.logger.warn("codex processor: Stop sentinel not found; emitting partial turn", {
+      this.logger.warn("codex processor: task_complete sentinel not found; partial turn", {
         queueId: this.queueId,
+        eventName: event.eventName,
         turnId,
       });
     }
@@ -659,6 +783,10 @@ export class CodexEventProcessor implements EventProcessor {
         this.noteModel(scope, record);
         return;
       }
+      if (record.type === RECORD_COMPACTED) {
+        this.handleCompacted(scope, record);
+        return;
+      }
       if (record.type === RECORD_EVENT_MSG) {
         const ptype = record.payload?.type;
         if (ptype === EVT_TASK_STARTED) this.startTurnSpan(scope, record);
@@ -863,6 +991,103 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
+  // Handle a `compacted` record: the current turn is a context compaction (Codex
+  // runs it as its own turn). Relabel that turn span as a "compaction" span with
+  // metadata (trigger from the PreCompact/PostCompact hook, the count of messages
+  // the compaction collapsed to, and the window_id) and a tag, then open an llm
+  // span representing the compaction model call. The following token_count closes
+  // that llm span with its token usage, so the trace shows what the compaction
+  // did: the conversation before it (input) and the kept context after (output).
+  private handleCompacted(scope: TranscriptScope, record: TranscriptRecord): void {
+    const turnId = this.latestOpenTurnId(scope);
+    const turnSpan = this.latestOpenTurn(scope);
+    if (turnId === undefined || turnSpan === undefined) {
+      this.logger.debug("codex processor: compacted record with no open turn span", {
+        queueId: this.queueId,
+      });
+      return;
+    }
+    const payload = (record.payload ?? {}) as Record<string, unknown>;
+    const replacement = Array.isArray(payload.replacement_history)
+      ? (payload.replacement_history as unknown[])
+      : undefined;
+    const trigger = this.compactionTriggerByTurn.get(turnId);
+
+    // Relabel the turn span as a compaction span and annotate it. Keep the span
+    // so a PreCompact/PostCompact hook arriving later can back-fill the trigger.
+    this.compactionSpansByTurn.set(turnId, turnSpan);
+    try {
+      turnSpan.setAttributes({ name: "compaction", type: "task" });
+      turnSpan.log({
+        metadata: {
+          compaction: {
+            trigger,
+            replaced_message_count: replacement?.length,
+            window_id: payload.window_id,
+          },
+        },
+        tags: [COMPACTION_TAG],
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to annotate compaction span", {
+        queueId: this.queueId,
+        turnId,
+        error: String(err),
+      });
+    }
+
+    // Open an llm span for the compaction model call. To make it self-evident
+    // (and avoid the "model just echoed the user" look), shape input/output as
+    // before/after of the context window:
+    //   input  = the conversation history before compaction (+ its count)
+    //   output = the kept context after compaction (readable messages) plus a
+    //            clear marker for the summary, which Codex stores encrypted and
+    //            does not expose to us.
+    // Closed by the turn's token_count (metrics) like any other model call.
+    const startTime = isoToUnixSeconds(record.timestamp);
+    const before = scope.conversationHistory.map((item) => ({ ...item }));
+    const output = compactionOutput(replacement);
+    try {
+      const span = turnSpan.startSpan({
+        name: scope.model ?? "compaction",
+        type: "llm",
+        ...(startTime !== undefined ? { startTime } : {}),
+        event: {
+          input: { messages_before_compaction: before.length, history: before },
+          output,
+          metadata: { model: scope.model, turn_id: turnId, compaction: true },
+        },
+      });
+      // Reuse the open-llm slot so the turn's token_count closes it with usage.
+      // outputPreset: the replacement history is already logged as the output, so
+      // the closing token_count must not overwrite it.
+      scope.openLlm = { span, turnId, output: [], outputPreset: true };
+    } catch (err) {
+      this.logger.error("codex processor: failed to open compaction llm span", {
+        queueId: this.queueId,
+        turnId,
+        error: String(err),
+      });
+    }
+  }
+
+  // Patch the trigger onto a compaction span when its PreCompact/PostCompact hook
+  // arrives after the span was already built from the transcript. No-op if the
+  // span isn't known yet (handleCompacted will read the trigger from the map).
+  private backfillCompactionTrigger(turnId: string, trigger: string): void {
+    const span = this.compactionSpansByTurn.get(turnId);
+    if (span === undefined) return;
+    try {
+      span.log({ metadata: { compaction: { trigger } } });
+    } catch (err) {
+      this.logger.error("codex processor: failed to back-fill compaction trigger", {
+        queueId: this.queueId,
+        turnId,
+        error: String(err),
+      });
+    }
+  }
+
   // Set the open turn's input from a user_message event (the prompt). The
   // user_message carries no turn_id, so it applies to the most recently opened
   // still-open turn in this scope.
@@ -1020,9 +1245,9 @@ export class CodexEventProcessor implements EventProcessor {
     const usage = (info.last_token_usage ?? {}) as Record<string, unknown>;
     const metrics = tokenMetrics(usage);
     const endTime = isoToUnixSeconds(record.timestamp);
-    const { span, output } = scope.openLlm;
+    const { span, output, outputPreset } = scope.openLlm;
     try {
-      span.log({ output: llmOutput(output), metrics });
+      span.log(outputPreset ? { metrics } : { output: llmOutput(output), metrics });
       span.end(endTime !== undefined ? { endTime } : undefined);
       this.logger.info("codex processor: ended llm span", { queueId: this.queueId });
     } catch (err) {
@@ -1122,6 +1347,9 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
+    // If this call requested escalated permissions (Codex records the request
+    // inline in the arguments), surface it on the span as metadata and a tag.
+    const permission = permissionInfo(input);
     const startTime = isoToUnixSeconds(record.timestamp);
     try {
       const toolSpan = turnSpan.startSpan({
@@ -1130,7 +1358,8 @@ export class CodexEventProcessor implements EventProcessor {
         ...(startTime !== undefined ? { startTime } : {}),
         event: {
           input,
-          metadata: { tool_name: name, call_id: callId, turn_id: turnId },
+          metadata: { tool_name: name, call_id: callId, turn_id: turnId, permission },
+          ...(permission !== undefined ? { tags: [PERMISSION_TAG] } : {}),
         },
       });
       scope.openTools.set(callId, { span: toolSpan, turnId });
