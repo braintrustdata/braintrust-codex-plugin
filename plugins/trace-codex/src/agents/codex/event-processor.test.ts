@@ -1430,10 +1430,11 @@ describe("CodexEventProcessor: subagents", () => {
       expect(mainTurn).toBeDefined();
 
       // The spawn_agent tool span is under the main turn, and the subagent root
-      // is nested under it (not a sibling of the main turn, not duplicated).
+      // is a SIBLING of it (both under the main turn) — not nested in the tool.
       const spawn = mainTurn?.children.find((c) => c.name === "spawn_agent");
       expect(spawn?.type).toBe("tool");
-      const subRoot = spawn?.children.find((c) => c.name === "subagent: agent-1");
+      expect(spawn?.children.some((c) => c.name === "subagent: agent-1")).toBe(false);
+      const subRoot = mainTurn?.children.find((c) => c.name === "subagent: agent-1");
       expect(subRoot).toBeDefined();
       expect(subRoot?.type).toBe("task");
       // The subagent root carries its own transcript path.
@@ -1553,10 +1554,9 @@ describe("CodexEventProcessor: subagents", () => {
       await processor.flush();
 
       const tree = spansToTree(await trace.drain());
-      const spawn = tree?.children
-        .find((c) => c.name === "turn: main-1")
-        ?.children.find((c) => c.name === "spawn_agent");
-      const subRoot = spawn?.children.find((c) => c.name === "subagent: agent-1");
+      // The subagent root is a sibling of the spawn_agent tool (under main-1).
+      const mainTurn = tree?.children.find((c) => c.name === "turn: main-1");
+      const subRoot = mainTurn?.children.find((c) => c.name === "subagent: agent-1");
       const subTurn = subRoot?.children.find((c) => c.name === "turn: sub-1");
 
       // The subagent root and turn are closed (not hanging), and the post-finalize

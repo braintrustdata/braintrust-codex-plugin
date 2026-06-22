@@ -346,15 +346,17 @@ export class CodexEventProcessor implements EventProcessor {
   // The main session's scope (its turns hang under the root span). Created on
   // the first hook carrying the main transcript path.
   private mainScope: TranscriptScope | null = null;
-  // call_id -> the spawn_agent tool span, recorded when a spawn_agent tool span
-  // opens in the main transcript. The spawn_agent PostToolUse hook carries the
-  // resulting agent_id and the call_id (tool_use_id), letting us map agent_id to
-  // its spawn tool span (below) even after the tool span has closed.
-  private readonly spawnToolSpansByCallId = new Map<string, Span>();
-  // agent_id -> the spawn_agent tool span that created that subagent. Used to
-  // parent a subagent's root span under the spawning tool. Resolved from the
-  // spawn_agent PostToolUse (agent_id + call_id) via spawnToolSpansByCallId.
-  private readonly spawnToolSpansByAgentId = new Map<string, Span>();
+  // call_id -> the turn span that contains a spawn_agent tool call, recorded when
+  // that tool span opens in the main transcript. The spawn_agent PostToolUse hook
+  // carries the resulting agent_id and the call_id (tool_use_id), letting us map
+  // agent_id to that turn span (below). We keep the TURN (not the tool span) so a
+  // subagent's root can be parented as a SIBLING of the spawn_agent tool — both
+  // under the same turn — rather than nested inside the tool.
+  private readonly spawnTurnSpansByCallId = new Map<string, Span>();
+  // agent_id -> the turn span under which that subagent should be parented (the
+  // turn that ran the spawn_agent tool). Resolved from the spawn_agent PostToolUse
+  // (agent_id + call_id) via spawnTurnSpansByCallId.
+  private readonly spawnTurnSpansByAgentId = new Map<string, Span>();
   // turn_id -> compaction trigger ("manual"/"auto"), recorded from the
   // PreCompact/PostCompact hooks (the transcript's compacted record lacks the
   // trigger). A side map so the hook and the transcript's compacted record can
@@ -621,24 +623,25 @@ export class CodexEventProcessor implements EventProcessor {
       if (typeof ar === "string") agentId = ar;
     }
     if (agentId === undefined) return;
-    const span = this.spawnToolSpansByCallId.get(callId);
-    if (span === undefined) {
-      this.logger.debug("codex processor: spawn_agent PostToolUse with no known tool span", {
+    const turnSpan = this.spawnTurnSpansByCallId.get(callId);
+    if (turnSpan === undefined) {
+      this.logger.debug("codex processor: spawn_agent PostToolUse with no known turn span", {
         queueId: this.queueId,
         callId,
         agentId,
       });
       return;
     }
-    this.spawnToolSpansByAgentId.set(agentId, span);
+    this.spawnTurnSpansByAgentId.set(agentId, turnSpan);
   }
 
   // A subagent is starting. Register a scope reading the subagent's own
   // transcript so its turns/llm/tools build a full hierarchy. The subagent root
   // span is created lazily from the subagent's session_meta (so it gets a real
-  // start time); we stash the parent here — the spawn_agent tool span that
-  // created it (matched by agent_id from the spawn_agent PostToolUse), or the
-  // main root span as a fallback if that mapping isn't known.
+  // start time); we stash the parent here — the turn span that ran the
+  // spawn_agent tool (matched by agent_id from the spawn_agent PostToolUse), so
+  // the subagent root is a SIBLING of that spawn_agent tool span. Falls back to
+  // the main root span if that mapping isn't known.
   private handleSubagentStart(event: EnqueueEvent): void {
     const data = (event.eventData ?? {}) as Record<string, unknown>;
     const agentId = typeof data.agent_id === "string" ? data.agent_id : undefined;
@@ -651,7 +654,7 @@ export class CodexEventProcessor implements EventProcessor {
     }
     if (this.scopes.has(path)) return; // already registered
 
-    const parent = this.spawnToolSpansByAgentId.get(agentId) ?? this.rootSpan;
+    const parent = this.spawnTurnSpansByAgentId.get(agentId) ?? this.rootSpan;
     if (parent === null) {
       this.logger.warn("codex processor: SubagentStart with no parent span; skipping", {
         queueId: this.queueId,
@@ -669,9 +672,10 @@ export class CodexEventProcessor implements EventProcessor {
     });
   }
 
-  // Create a subagent's root span from its session_meta record (child of the
-  // spawn_agent tool span, with the record's timestamp as start time). Called
-  // once per subagent scope, when its session_meta is first consumed.
+  // Create a subagent's root span from its session_meta record (sibling of the
+  // spawn_agent tool span — both under the spawning turn — with the record's
+  // timestamp as start time). Called once per subagent scope, when its
+  // session_meta is first consumed.
   private startSubagentRootSpan(scope: TranscriptScope, record: TranscriptRecord): void {
     const pending = scope.pendingSubagent;
     if (pending === undefined || scope.subagentRootSpan !== null) return;
@@ -1375,12 +1379,12 @@ export class CodexEventProcessor implements EventProcessor {
         },
       });
       scope.openTools.set(callId, { span: toolSpan, turnId });
-      // Remember spawn_agent tool spans (main scope only) so a subagent's root
-      // span can be nested under the tool that launched it. The agent_id is not
-      // in the transcript; it arrives on the spawn_agent PostToolUse hook, which
-      // we map to this span by call_id.
+      // Remember the TURN span that ran a spawn_agent tool (main scope only) so a
+      // subagent's root span can be parented as a sibling of the tool (both under
+      // this turn). The agent_id isn't in the transcript; it arrives on the
+      // spawn_agent PostToolUse hook, which we map to this turn by call_id.
       if (scope.kind === "main" && name === SPAWN_AGENT_TOOL) {
-        this.spawnToolSpansByCallId.set(callId, toolSpan);
+        this.spawnTurnSpansByCallId.set(callId, turnSpan);
       }
       this.logger.info("codex processor: opened tool span", {
         queueId: this.queueId,
