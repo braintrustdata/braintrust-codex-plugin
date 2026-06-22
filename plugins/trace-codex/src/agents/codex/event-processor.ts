@@ -681,7 +681,14 @@ export class CodexEventProcessor implements EventProcessor {
         name: `subagent: ${pending.agentId}`,
         type: "task",
         ...(startTime !== undefined ? { startTime } : {}),
-        event: { metadata: { agent_id: pending.agentId, agent_type: pending.agentType } },
+        event: {
+          metadata: {
+            agent_id: pending.agentId,
+            agent_type: pending.agentType,
+            // The subagent's own rollout transcript on disk.
+            transcript_path: scope.path,
+          },
+        },
       });
       this.logger.info("codex processor: opened subagent root span", {
         queueId: this.queueId,
@@ -749,6 +756,9 @@ export class CodexEventProcessor implements EventProcessor {
   // scope, advancing nothing (the caller owns the offset). Used by catch-up and
   // by the final flush read.
   private consumeLines(scope: TranscriptScope, lines: string[]): void {
+    // A finalized subagent scope is inert: never re-open/mutate its spans (a
+    // re-read after SubagentStop would otherwise re-open already-closed spans).
+    if (scope.subagentEnded) return;
     for (const line of lines) {
       const record = parseTranscriptLine(line);
       if (record === null) continue;
@@ -909,6 +919,8 @@ export class CodexEventProcessor implements EventProcessor {
             permission_mode: this.rootEnrichment.permissionMode,
             cli_version: typeof payload.cli_version === "string" ? payload.cli_version : undefined,
             project: this.reportingConfig?.project,
+            // The session's rollout transcript on disk (the source for this trace).
+            transcript_path: this.mainScope?.path,
           },
         },
       });
@@ -1570,6 +1582,10 @@ export class CodexEventProcessor implements EventProcessor {
     const deadline = Date.now() + FLUSH_TIMEOUT_MS;
     for (;;) {
       for (const scope of this.scopes.values()) {
+        // A finalized subagent scope is inert: re-reading it would re-open spans
+        // that were already closed (and the SDK would overwrite the closed spans
+        // with un-ended ones). Skip it.
+        if (scope.subagentEnded) continue;
         try {
           const { lines, offset } = this.transcriptReader.readFrom(scope.path, scope.offset);
           scope.offset = offset;

@@ -298,12 +298,32 @@ export class FakeTranscriptReader implements TranscriptReader {
  */
 export class MultiFileTranscriptReader implements TranscriptReader {
   private readonly buffers = new Map<string, string>();
+  /** Per-path withheld trailing line that only appears after N more reads. */
+  private readonly withheldByPath = new Map<string, { line: string; afterReads: number }>();
 
   append(path: string, line: string): void {
     this.buffers.set(path, `${this.buffers.get(path) ?? ""}${line}\n`);
   }
 
+  /**
+   * Append a line to `path` that only becomes visible after `afterReads` more
+   * reads of that path. Models a record Codex writes slightly later, so it isn't
+   * seen by the catch-up that's running now but is by a subsequent one.
+   */
+  withhold(path: string, line: string, afterReads: number): void {
+    this.withheldByPath.set(path, { line, afterReads });
+  }
+
   readFrom(path: string, offset: number): TranscriptReadResult {
+    const pending = this.withheldByPath.get(path);
+    if (pending !== undefined) {
+      if (pending.afterReads <= 0) {
+        this.append(path, pending.line);
+        this.withheldByPath.delete(path);
+      } else {
+        pending.afterReads -= 1;
+      }
+    }
     const buffer = this.buffers.get(path) ?? "";
     const from = offset > buffer.length ? 0 : offset;
     const slice = buffer.slice(from);

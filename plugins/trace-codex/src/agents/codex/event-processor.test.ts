@@ -25,6 +25,7 @@ import {
   stop,
   subagentStart,
   subagentStop,
+  TEST_TRANSCRIPT_PATH,
   taskComplete,
   taskStarted,
   tokenCount,
@@ -55,7 +56,12 @@ describe("CodexEventProcessor: root span", () => {
       ],
       {
         span_attributes: { name: "codex: myapp", type: "task" },
-        metadata: { session_id: "session-1", model: "gpt-5.5", source: "startup" },
+        metadata: {
+          session_id: "session-1",
+          model: "gpt-5.5",
+          source: "startup",
+          transcript_path: TEST_TRANSCRIPT_PATH,
+        },
         children: [],
       },
     );
@@ -1418,6 +1424,8 @@ describe("CodexEventProcessor: subagents", () => {
 
       const tree = spansToTree(await trace.drain());
       expect(tree?.name).toBe("codex: app");
+      // The root carries the main session's transcript path.
+      expect(tree?.metadata?.transcript_path).toBe(MAIN);
       const mainTurn = tree?.children.find((c) => c.name === "turn: main-1");
       expect(mainTurn).toBeDefined();
 
@@ -1428,6 +1436,8 @@ describe("CodexEventProcessor: subagents", () => {
       const subRoot = spawn?.children.find((c) => c.name === "subagent: agent-1");
       expect(subRoot).toBeDefined();
       expect(subRoot?.type).toBe("task");
+      // The subagent root carries its own transcript path.
+      expect(subRoot?.metadata?.transcript_path).toBe(SUB);
 
       const subTurn = subRoot?.children.find((c) => c.name === "turn: sub-1");
       expect(subTurn).toBeDefined();
@@ -1436,6 +1446,125 @@ describe("CodexEventProcessor: subagents", () => {
 
       // No subagent turn leaked to the top level (the original bug).
       expect(tree?.children.some((c) => c.name === "turn: sub-1")).toBe(false);
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // Regression for the live bug: after SubagentStop finalizes a subagent, a later
+  // flush (which drains every scope) must NOT re-read the subagent transcript and
+  // re-open its already-closed spans — doing so left the subagent root/turn/llm
+  // hanging (no end) because the re-opened, un-ended spans overwrote the closed
+  // ones. A finalized subagent scope must be inert.
+  test("a finalized subagent's spans stay closed across later flushes", async () => {
+    const reader = new MultiFileTranscriptReader();
+    const w = (path: string, record: Record<string, unknown>) =>
+      reader.append(path, JSON.stringify(transcript(record).record));
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+      await processor.process(configEvent({ session_id: "s" }));
+
+      // Main session spawns a subagent and stays open (no main Stop yet).
+      w(MAIN, { type: "session_meta", payload: { id: "s", cwd: "/work/app" } });
+      w(MAIN, { type: "event_msg", payload: { type: "task_started", turn_id: "main-1" } });
+      w(MAIN, {
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          call_id: "call_spawn",
+          arguments: "{}",
+          metadata: { turn_id: "main-1" },
+        },
+      });
+      w(MAIN, {
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_spawn", output: "{}" },
+      });
+      await processor.process(sessionStart({ session_id: "s", transcript_path: MAIN }));
+      await processor.process(
+        postToolUse({
+          session_id: "s",
+          transcript_path: MAIN,
+          tool_name: "spawn_agent",
+          tool_use_id: "call_spawn",
+          tool_response: JSON.stringify({ agent_id: "agent-1" }),
+        }),
+      );
+
+      // Subagent transcript: a turn with a model call, then task_complete, then a
+      // TRAILING record after task_complete. SubagentStop's bounded wait stops at
+      // the task_complete sentinel, leaving the trailing record unconsumed; a
+      // later flush would otherwise re-read it and re-open spans on the finalized
+      // scope (the bug). With the fix, the finalized scope is inert.
+      w(SUB, { type: "session_meta", payload: { id: "agent-1" } });
+      w(SUB, { type: "event_msg", payload: { type: "task_started", turn_id: "sub-1" } });
+      w(SUB, { type: "turn_context", payload: { model: "gpt-5.5" } });
+      w(SUB, { type: "response_item", payload: { type: "reasoning", summary: [] } });
+      w(SUB, {
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: {} } },
+      });
+      w(SUB, {
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "sub-1", last_agent_message: "sub done" },
+      });
+      await processor.process(
+        subagentStart({
+          session_id: "s",
+          transcript_path: SUB,
+          agent_id: "agent-1",
+          agent_type: "default",
+        }),
+      );
+      await processor.process(
+        subagentStop({
+          session_id: "s",
+          transcript_path: MAIN,
+          agent_transcript_path: SUB,
+          agent_id: "agent-1",
+        }),
+      );
+
+      // After finalize, MORE records land in the subagent transcript (Codex can
+      // write trailing records, and the rollout file persists). A later flush
+      // drains every scope and re-reads this file. If the finalized scope weren't
+      // inert, these would re-open a turn + llm on it, leaving spans hanging.
+      w(SUB, { type: "event_msg", payload: { type: "task_started", turn_id: "sub-2" } });
+      w(SUB, { type: "response_item", payload: { type: "reasoning", summary: [] } });
+      w(SUB, {
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: {} } },
+      });
+      await processor.flush();
+
+      // Main session finishes.
+      w(MAIN, {
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "main-1", last_agent_message: "done" },
+      });
+      await processor.process(stop({ session_id: "s", transcript_path: MAIN, turn_id: "main-1" }));
+      await processor.flush();
+
+      const tree = spansToTree(await trace.drain());
+      const spawn = tree?.children
+        .find((c) => c.name === "turn: main-1")
+        ?.children.find((c) => c.name === "spawn_agent");
+      const subRoot = spawn?.children.find((c) => c.name === "subagent: agent-1");
+      const subTurn = subRoot?.children.find((c) => c.name === "turn: sub-1");
+
+      // The subagent root and turn are closed (not hanging), and the post-finalize
+      // records did NOT re-open anything: no second turn, no re-opened llm.
+      expect(subRoot?.metrics?.end).toBeDefined();
+      expect(subTurn?.metrics?.end).toBeDefined();
+      expect(subRoot?.children.some((c) => c.name === "turn: sub-2")).toBe(false);
+      expect(subRoot?.children.filter((c) => c.name?.startsWith("turn:")).length).toBe(1);
     } finally {
       trace.cleanup();
     }
