@@ -59,6 +59,10 @@ import { defaultTranscriptReader, type TranscriptReader } from "./transcript-rea
 
 const SESSION_START = "SessionStart";
 const STOP = "Stop";
+const SUBAGENT_START = "SubagentStart";
+const SUBAGENT_STOP = "SubagentStop";
+const POST_TOOL_USE = "PostToolUse";
+const SPAWN_AGENT_TOOL = "spawn_agent";
 
 // Bound on how long a Stop hook waits for the turn's task_complete to appear in
 // the transcript before giving up and emitting whatever exists. Codex can write
@@ -137,6 +141,53 @@ interface OpenLlm {
   output: ChatMessage[];
 }
 
+/**
+ * All parsing state tied to a single transcript file. The main session has one
+ * scope (its parent is the root span); each subagent gets its own scope (its
+ * parent is the subagent root span, a child of the spawn_agent tool that created
+ * it). Keeping offset + open spans per file is essential: a session and its
+ * subagents are interleaved on one hook stream but write to separate transcript
+ * files, so a single shared offset would read the wrong file's bytes.
+ */
+interface TranscriptScope {
+  /** Absolute transcript path this scope reads from. */
+  readonly path: string;
+  /** "main" session vs. a spawned subagent. */
+  readonly kind: "main" | "subagent";
+  /**
+   * Parent span for this scope's turn spans. For the main scope this is the
+   * root span; for a subagent it is the subagent root span. Resolved lazily so a
+   * subagent scope can be registered before its parent span is built.
+   */
+  readonly parentSpan: () => Span | null;
+  /** Byte offset already consumed from `path`. */
+  offset: number;
+  /** Turn spans currently open in this scope, keyed by turn_id. */
+  readonly openTurns: Map<string, Span>;
+  /** turn_ids whose Stop has fired but whose task_complete hasn't been seen. */
+  readonly turnsAwaitingCompletion: Set<string>;
+  /** OpenAI-style chat history, used to reconstruct each LLM call's input. */
+  readonly conversationHistory: ChatMessage[];
+  /** The currently-open LLM span in this scope, if a model call is in progress. */
+  openLlm: OpenLlm | null;
+  /** Tool spans currently open in this scope, keyed by call_id. */
+  readonly openTools: Map<string, { span: Span; turnId: string }>;
+  /** Model slug, learned from this scope's first turn_context. */
+  model: string | undefined;
+  /** End time (Unix seconds) of the most recently completed turn in this scope. */
+  lastTurnEndTime: number | undefined;
+  /**
+   * For a subagent scope: its root span (the span the subagent's turns hang
+   * under) and whether it has been ended. Null/false for the main scope, which
+   * uses the processor's root span instead. The root span is created lazily from
+   * the subagent's own session_meta record (so it gets a real start time);
+   * `pendingSubagent` holds what's needed to create it until then.
+   */
+  subagentRootSpan: Span | null;
+  subagentEnded: boolean;
+  pendingSubagent?: { agentId: string; agentType: string | undefined; parent: Span };
+}
+
 /** Map Codex token usage keys onto Braintrust's standard metric names. */
 function tokenMetrics(usage: Record<string, unknown>): Record<string, number> {
   const metrics: Record<string, number> = {};
@@ -187,43 +238,28 @@ export class CodexEventProcessor implements EventProcessor {
   private reportingConfig: ReportingConfig | undefined;
   private rootSpan: Span | null = null;
   private rootEnded = false;
-  // Turn spans currently open, keyed by turn_id. A turn is opened by
-  // task_started and closed by the matching task_complete.
-  private readonly openTurns = new Map<string, Span>();
-  // turn_ids whose Stop hook has fired but whose task_complete hasn't been seen
-  // yet (Codex can write task_complete seconds after the Stop hook). flush()
-  // only blocks-and-polls when one of these is still open; a turn that is merely
-  // mid-progress (no Stop yet) does not make an idle flush wait.
-  private readonly turnsAwaitingCompletion = new Set<string>();
-  // Conversation history accumulated from transcript records (developer/user/
-  // assistant messages and tool calls/outputs), as OpenAI-style chat messages.
-  // The transcript does not log the outbound API request, so we reconstruct each
-  // LLM call's input as the history captured up to the moment its span opens.
-  private readonly conversationHistory: ChatMessage[] = [];
-  // The currently-open LLM span, if a model call is in progress. One LLM call =
-  // a run of reasoning/message (+ tool) items terminated by a token_count.
-  private openLlm: OpenLlm | null = null;
-  // Tool spans currently open, keyed by call_id. Opened by a tool-call
-  // response_item and closed by the matching *_output; ordered by start time.
-  private readonly openTools = new Map<string, { span: Span; turnId: string }>();
   // Root enrichment from the SessionStart hook (source/permission_mode), which
   // the transcript lacks. Applied when the root span is created, or patched onto
   // the root if it already exists.
   private rootEnrichment: RootEnrichment = {};
-  // Model slug, learned from the first turn_context (session_meta has none).
-  private model: string | undefined;
-  // End time (Unix seconds) of the most recently completed turn. Used to end the
-  // root span at the right time when the session is finalized (on flush), since
-  // Codex has no session-end hook and the SDK records a span's end time once.
-  private lastTurnEndTime: number | undefined;
   // Reads new transcript content on each hook (the "catch-up").
   private readonly transcriptReader: TranscriptReader;
-  // Byte offset into the transcript already consumed. In-memory only; if this
-  // processor is evicted and recreated, the transcript is re-read from 0.
-  private transcriptOffset = 0;
-  // Transcript path from the latest hook, so flush() can do a final catch-up
-  // (the last turn's task_complete can land just after its Stop hook fires).
-  private transcriptPath: string | null = null;
+  // One parsing scope per transcript file (the main session plus one per
+  // subagent), keyed by transcript path. Each owns its own offset and open
+  // spans, so interleaved hooks for different files never cross-contaminate.
+  private readonly scopes = new Map<string, TranscriptScope>();
+  // The main session's scope (its turns hang under the root span). Created on
+  // the first hook carrying the main transcript path.
+  private mainScope: TranscriptScope | null = null;
+  // call_id -> the spawn_agent tool span, recorded when a spawn_agent tool span
+  // opens in the main transcript. The spawn_agent PostToolUse hook carries the
+  // resulting agent_id and the call_id (tool_use_id), letting us map agent_id to
+  // its spawn tool span (below) even after the tool span has closed.
+  private readonly spawnToolSpansByCallId = new Map<string, Span>();
+  // agent_id -> the spawn_agent tool span that created that subagent. Used to
+  // parent a subagent's root span under the spawning tool. Resolved from the
+  // spawn_agent PostToolUse (agent_id + call_id) via spawnToolSpansByCallId.
+  private readonly spawnToolSpansByAgentId = new Map<string, Span>();
 
   constructor(
     queueId: string | null,
@@ -252,8 +288,9 @@ export class CodexEventProcessor implements EventProcessor {
 
   // Dispatcher. The config event short-circuits (it configures reporting and
   // must run before any spans). Every other hook (a) records any hook-only data
-  // it carries, (b) catches up the transcript into spans, and on Stop (c) ends
-  // the root span. Wrapped so transcript work can never break the turn.
+  // it carries (root enrichment, subagent lifecycle), (b) catches up the
+  // relevant transcript into spans, and on a main-session Stop (c) ends the root
+  // span. Wrapped so transcript work can never break the turn.
   async process(event: EnqueueEvent): Promise<void> {
     if (event.eventName === CODEX_CONFIG_EVENT) {
       this.configure(event);
@@ -268,70 +305,96 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
 
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const agentId = typeof data.agent_id === "string" ? data.agent_id : undefined;
+
     if (event.eventName === SESSION_START) {
       this.recordRootEnrichment(event);
     }
 
+    // A subagent is starting: open its root span (under the spawn_agent tool that
+    // created it) and register a scope for its transcript so its hooks build a
+    // full turn/llm/tool hierarchy inside that span.
+    if (event.eventName === SUBAGENT_START) {
+      this.handleSubagentStart(event);
+    }
+
+    // Resolve the scope this hook belongs to (main vs. a specific subagent) by
+    // its transcript path, so each file keeps its own offset and open spans.
+    const scope = this.scopeForEvent(event);
+
     // A Stop signals its turn is finishing; mark it so flush knows to wait for
     // this turn's task_complete (which Codex may write after the Stop hook).
-    if (event.eventName === STOP) {
-      const data = (event.eventData ?? {}) as Record<string, unknown>;
+    if ((event.eventName === STOP || event.eventName === SUBAGENT_STOP) && scope !== null) {
       const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
-      if (turnId !== undefined) this.turnsAwaitingCompletion.add(turnId);
+      if (turnId !== undefined) scope.turnsAwaitingCompletion.add(turnId);
     }
 
-    try {
-      await this.catchUpTranscript(event);
-    } catch (err) {
-      this.logger.error("codex processor: transcript catch-up failed", {
-        queueId: this.queueId,
-        eventName: event.eventName,
-        error: String(err),
-      });
+    if (scope !== null) {
+      try {
+        await this.catchUpScope(scope, event);
+      } catch (err) {
+        this.logger.error("codex processor: transcript catch-up failed", {
+          queueId: this.queueId,
+          eventName: event.eventName,
+          error: String(err),
+        });
+      }
     }
 
-    // End the root span on the first Stop. The catch-up above has already
-    // processed this turn's task_complete, so lastTurnEndTime is the turn's
-    // completion time — used as the root's end time so it isn't stamped with a
-    // late wall-clock value.
-    if (event.eventName === STOP) {
-      this.endRootSpan(this.lastTurnEndTime);
+    // After catching up the main transcript (which creates the spawn_agent tool
+    // span), map the resulting subagent's agent_id to that span so a following
+    // SubagentStart can nest the subagent under it. The PostToolUse's tool_use_id
+    // is the spawn_agent function_call's call_id; its tool_response carries the
+    // agent_id.
+    if (event.eventName === POST_TOOL_USE && agentId === undefined) {
+      this.recordSpawnedAgent(event);
+    }
+
+    // A subagent has finished: close its turns and root span.
+    if (event.eventName === SUBAGENT_STOP && agentId !== undefined) {
+      this.handleSubagentStop(event, agentId);
+    }
+
+    // End the (main) root span on the first main-session Stop. A SubagentStop
+    // must NOT end the root — the parent session is still running.
+    if (event.eventName === STOP && agentId === undefined) {
+      this.endRootSpan(this.mainScope?.lastTurnEndTime);
     }
   }
 
-  // Read transcript lines appended since our last read and turn each into spans.
-  // The transcript path comes from the hook payload. Never throws.
+  // Read transcript lines appended to this scope's file since its last read and
+  // turn each into spans. Never throws.
   //
-  // On a Stop, first consume whatever's already on disk. If that closes the
-  // turn, we're done. Otherwise Codex hasn't written this turn's task_complete
-  // yet (it can lag the Stop hook by seconds), so wait (bounded) for it — but
-  // only then, so a Stop whose turn is already complete returns immediately.
-  private async catchUpTranscript(event: EnqueueEvent): Promise<void> {
+  // On a Stop/SubagentStop, first consume whatever's already on disk. If that
+  // closes the turn, we're done. Otherwise Codex hasn't written this turn's
+  // task_complete yet (it can lag the Stop hook by seconds), so wait (bounded)
+  // for it — but only then, so a Stop whose turn is already complete returns
+  // immediately.
+  private async catchUpScope(scope: TranscriptScope, event: EnqueueEvent): Promise<void> {
     const data = (event.eventData ?? {}) as Record<string, unknown>;
-    const path = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
-    if (path === undefined) return;
-    this.transcriptPath = path;
 
     // Initial read of everything available now.
-    const initial = this.transcriptReader.readFrom(path, this.transcriptOffset);
-    this.transcriptOffset = initial.offset;
-    this.consumeLines(initial.lines);
+    const initial = this.transcriptReader.readFrom(scope.path, scope.offset);
+    scope.offset = initial.offset;
+    this.consumeLines(scope, initial.lines);
 
-    if (event.eventName !== STOP) return;
+    const isStop = event.eventName === STOP || event.eventName === SUBAGENT_STOP;
+    if (!isStop) return;
 
     const turnId = typeof data.turn_id === "string" ? data.turn_id : undefined;
     // If the turn already closed during the initial read, no wait is needed.
-    if (turnId === undefined || !this.openTurns.has(turnId)) return;
+    if (turnId === undefined || !scope.openTurns.has(turnId)) return;
 
     // Wait (bounded) for this turn's task_complete to be written.
     const result = await this.transcriptReader.waitFor(
-      path,
-      this.transcriptOffset,
+      scope.path,
+      scope.offset,
       (line) => this.isTaskCompleteFor(line, turnId),
       { timeoutMs: SENTINEL_TIMEOUT_MS, intervalMs: SENTINEL_INTERVAL_MS },
     );
-    this.transcriptOffset = result.offset;
-    this.consumeLines(result.lines);
+    scope.offset = result.offset;
+    this.consumeLines(scope, result.lines);
     if (!result.sentinelFound) {
       this.logger.warn("codex processor: Stop sentinel not found; emitting partial turn", {
         queueId: this.queueId,
@@ -340,13 +403,232 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
-  // Parse and process a batch of transcript lines into spans, advancing nothing
-  // (the caller owns the offset). Used by catch-up and by the final flush read.
-  private consumeLines(lines: string[]): void {
+  // ==========================================================================
+  // Transcript scopes
+  // ==========================================================================
+
+  // Resolve (creating if needed) the scope a hook belongs to, by its transcript
+  // path. A subagent hook (carrying agent_id) uses the subagent's transcript;
+  // its scope is created by SubagentStart and looked up here. Everything else is
+  // the main session. Returns null if the hook carries no usable transcript path
+  // or a subagent scope hasn't been registered yet.
+  private scopeForEvent(event: EnqueueEvent): TranscriptScope | null {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const agentId = typeof data.agent_id === "string" ? data.agent_id : undefined;
+    // SubagentStop reports the subagent file under agent_transcript_path (its
+    // transcript_path points at the PARENT session), so prefer that.
+    const path =
+      agentId !== undefined && typeof data.agent_transcript_path === "string"
+        ? data.agent_transcript_path
+        : typeof data.transcript_path === "string"
+          ? data.transcript_path
+          : undefined;
+    if (path === undefined) return null;
+
+    if (agentId === undefined) return this.ensureMainScope(path);
+
+    // Subagent hook: its scope must already exist (registered by SubagentStart).
+    const existing = this.scopes.get(path);
+    if (existing !== undefined) return existing;
+    this.logger.debug("codex processor: subagent hook before its scope exists; skipping", {
+      queueId: this.queueId,
+      agentId,
+    });
+    return null;
+  }
+
+  // The main session's scope, created on first use. Its turns hang under the
+  // processor's root span.
+  private ensureMainScope(path: string): TranscriptScope {
+    if (this.mainScope !== null) return this.mainScope;
+    const scope = this.newScope(path, "main", () => this.rootSpan);
+    this.mainScope = scope;
+    this.scopes.set(path, scope);
+    return scope;
+  }
+
+  private newScope(
+    path: string,
+    kind: "main" | "subagent",
+    parentSpan: () => Span | null,
+  ): TranscriptScope {
+    return {
+      path,
+      kind,
+      parentSpan,
+      offset: 0,
+      openTurns: new Map(),
+      turnsAwaitingCompletion: new Set(),
+      conversationHistory: [],
+      openLlm: null,
+      openTools: new Map(),
+      model: undefined,
+      lastTurnEndTime: undefined,
+      subagentRootSpan: null,
+      subagentEnded: false,
+    };
+  }
+
+  // ==========================================================================
+  // Subagent lifecycle
+  // ==========================================================================
+
+  // Record the agent_id produced by a spawn_agent tool, mapping it to that
+  // tool's span (located by call_id), so a later SubagentStart can parent the
+  // subagent's root span under the spawning tool. No-op for non-spawn tools or
+  // when the tool span isn't known.
+  private recordSpawnedAgent(event: EnqueueEvent): void {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const toolName = typeof data.tool_name === "string" ? data.tool_name : undefined;
+    if (toolName !== SPAWN_AGENT_TOOL) return;
+    const callId = typeof data.tool_use_id === "string" ? data.tool_use_id : undefined;
+    if (callId === undefined) return;
+    const response = data.tool_response;
+    let agentId: string | undefined;
+    if (typeof response === "string") {
+      try {
+        const parsed = JSON.parse(response) as Record<string, unknown>;
+        if (typeof parsed.agent_id === "string") agentId = parsed.agent_id;
+      } catch {
+        // tool_response wasn't JSON; nothing to map.
+      }
+    } else if (response !== null && typeof response === "object") {
+      const ar = (response as Record<string, unknown>).agent_id;
+      if (typeof ar === "string") agentId = ar;
+    }
+    if (agentId === undefined) return;
+    const span = this.spawnToolSpansByCallId.get(callId);
+    if (span === undefined) {
+      this.logger.debug("codex processor: spawn_agent PostToolUse with no known tool span", {
+        queueId: this.queueId,
+        callId,
+        agentId,
+      });
+      return;
+    }
+    this.spawnToolSpansByAgentId.set(agentId, span);
+  }
+
+  // A subagent is starting. Register a scope reading the subagent's own
+  // transcript so its turns/llm/tools build a full hierarchy. The subagent root
+  // span is created lazily from the subagent's session_meta (so it gets a real
+  // start time); we stash the parent here — the spawn_agent tool span that
+  // created it (matched by agent_id from the spawn_agent PostToolUse), or the
+  // main root span as a fallback if that mapping isn't known.
+  private handleSubagentStart(event: EnqueueEvent): void {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const agentId = typeof data.agent_id === "string" ? data.agent_id : undefined;
+    const path = typeof data.transcript_path === "string" ? data.transcript_path : undefined;
+    if (agentId === undefined || path === undefined) {
+      this.logger.warn("codex processor: SubagentStart missing agent_id/transcript_path", {
+        queueId: this.queueId,
+      });
+      return;
+    }
+    if (this.scopes.has(path)) return; // already registered
+
+    const parent = this.spawnToolSpansByAgentId.get(agentId) ?? this.rootSpan;
+    if (parent === null) {
+      this.logger.warn("codex processor: SubagentStart with no parent span; skipping", {
+        queueId: this.queueId,
+        agentId,
+      });
+      return;
+    }
+    const agentType = typeof data.agent_type === "string" ? data.agent_type : undefined;
+    const scope = this.newScope(path, "subagent", () => scope.subagentRootSpan);
+    scope.pendingSubagent = { agentId, agentType, parent };
+    this.scopes.set(path, scope);
+    this.logger.info("codex processor: registered subagent scope", {
+      queueId: this.queueId,
+      agentId,
+    });
+  }
+
+  // Create a subagent's root span from its session_meta record (child of the
+  // spawn_agent tool span, with the record's timestamp as start time). Called
+  // once per subagent scope, when its session_meta is first consumed.
+  private startSubagentRootSpan(scope: TranscriptScope, record: TranscriptRecord): void {
+    const pending = scope.pendingSubagent;
+    if (pending === undefined || scope.subagentRootSpan !== null) return;
+    const startTime = isoToUnixSeconds(record.timestamp);
+    try {
+      scope.subagentRootSpan = pending.parent.startSpan({
+        name: `subagent: ${pending.agentId}`,
+        type: "task",
+        ...(startTime !== undefined ? { startTime } : {}),
+        event: { metadata: { agent_id: pending.agentId, agent_type: pending.agentType } },
+      });
+      this.logger.info("codex processor: opened subagent root span", {
+        queueId: this.queueId,
+        agentId: pending.agentId,
+        spanId: scope.subagentRootSpan.id,
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to open subagent root span", {
+        queueId: this.queueId,
+        agentId: pending.agentId,
+        error: String(err),
+      });
+    }
+  }
+
+  // A subagent has finished (its task_complete has been consumed by the catch-up
+  // in process()). Close any spans still open in its scope, then end its root
+  // span at the subagent's last turn end time.
+  private handleSubagentStop(event: EnqueueEvent, agentId: string): void {
+    const data = (event.eventData ?? {}) as Record<string, unknown>;
+    const path =
+      typeof data.agent_transcript_path === "string" ? data.agent_transcript_path : undefined;
+    const scope = path !== undefined ? this.scopes.get(path) : undefined;
+    if (scope === undefined || scope.subagentRootSpan === null) {
+      this.logger.debug("codex processor: SubagentStop with no scope/root span", {
+        queueId: this.queueId,
+        agentId,
+      });
+      return;
+    }
+    if (scope.subagentEnded) return;
+    scope.subagentEnded = true;
+    const endTime = scope.lastTurnEndTime;
+    const endArgs = endTime !== undefined ? { endTime } : undefined;
+    this.endOpenLlmSpan(scope, endTime);
+    this.closeAllOpenTools(scope, endArgs);
+    for (const [, span] of scope.openTurns) {
+      try {
+        span.end(endArgs);
+      } catch (err) {
+        this.logger.error("codex processor: failed to end dangling subagent turn span", {
+          queueId: this.queueId,
+          agentId,
+          error: String(err),
+        });
+      }
+    }
+    scope.openTurns.clear();
+    try {
+      scope.subagentRootSpan.end(endArgs);
+      this.logger.info("codex processor: ended subagent root span", {
+        queueId: this.queueId,
+        agentId,
+      });
+    } catch (err) {
+      this.logger.error("codex processor: failed to end subagent root span", {
+        queueId: this.queueId,
+        agentId,
+        error: String(err),
+      });
+    }
+  }
+
+  // Parse and process a batch of transcript lines into spans for the given
+  // scope, advancing nothing (the caller owns the offset). Used by catch-up and
+  // by the final flush read.
+  private consumeLines(scope: TranscriptScope, lines: string[]): void {
     for (const line of lines) {
       const record = parseTranscriptLine(line);
       if (record === null) continue;
-      this.processTranscriptEvent(record);
+      this.processTranscriptEvent(scope, record);
     }
   }
 
@@ -362,32 +644,35 @@ export class CodexEventProcessor implements EventProcessor {
     return record.payload?.turn_id === turnId;
   }
 
-  // Turn one parsed transcript record into span operations. Unknown record types
-  // are ignored. Never throws; per-record failures are logged.
-  private processTranscriptEvent(record: TranscriptRecord): void {
+  // Turn one parsed transcript record into span operations for its scope.
+  // Unknown record types are ignored. Never throws; per-record failures logged.
+  private processTranscriptEvent(scope: TranscriptScope, record: TranscriptRecord): void {
     try {
       if (record.type === RECORD_SESSION_META) {
-        this.startRootSpan(record);
+        // The main session's session_meta opens the processor root span; a
+        // subagent's opens its (lazily created) subagent root span.
+        if (scope.kind === "main") this.startRootSpan(record);
+        else this.startSubagentRootSpan(scope, record);
         return;
       }
       if (record.type === RECORD_TURN_CONTEXT) {
-        this.noteModel(record);
+        this.noteModel(scope, record);
         return;
       }
       if (record.type === RECORD_EVENT_MSG) {
         const ptype = record.payload?.type;
-        if (ptype === EVT_TASK_STARTED) this.startTurnSpan(record);
-        else if (ptype === EVT_USER_MESSAGE) this.setTurnInput(record);
-        else if (ptype === EVT_TASK_COMPLETE) this.endTurnSpan(record);
-        else if (ptype === EVT_TOKEN_COUNT) this.closeLlmSpan(record);
+        if (ptype === EVT_TASK_STARTED) this.startTurnSpan(scope, record);
+        else if (ptype === EVT_USER_MESSAGE) this.setTurnInput(scope, record);
+        else if (ptype === EVT_TASK_COMPLETE) this.endTurnSpan(scope, record);
+        else if (ptype === EVT_TOKEN_COUNT) this.closeLlmSpan(scope, record);
         return;
       }
       if (record.type === RECORD_RESPONSE_ITEM) {
         const ptype = record.payload?.type ?? "";
-        if (ptype === ITEM_MESSAGE) this.handleMessageItem(record);
-        else if (ptype === ITEM_REASONING) this.handleReasoningItem(record);
-        else if (TOOL_CALL_TYPES.has(ptype)) this.startToolSpan(record);
-        else if (TOOL_OUTPUT_TYPES.has(ptype)) this.endToolSpan(record);
+        if (ptype === ITEM_MESSAGE) this.handleMessageItem(scope, record);
+        else if (ptype === ITEM_REASONING) this.handleReasoningItem(scope, record);
+        else if (TOOL_CALL_TYPES.has(ptype)) this.startToolSpan(scope, record);
+        else if (TOOL_OUTPUT_TYPES.has(ptype)) this.endToolSpan(scope, record);
         return;
       }
     } catch (err) {
@@ -485,12 +770,12 @@ export class CodexEventProcessor implements EventProcessor {
         type: "task",
         ...(startTime !== undefined ? { startTime } : {}),
         event: {
-          input: { model: this.model, cwd, source: this.rootEnrichment.source },
+          input: { model: this.mainScope?.model, cwd, source: this.rootEnrichment.source },
           metadata: {
             // User-provided extras first, so the standard keys below win.
             ...this.reportingConfig?.additionalMetadata,
             session_id: sessionId,
-            model: this.model,
+            model: this.mainScope?.model,
             cwd,
             source: this.rootEnrichment.source,
             permission_mode: this.rootEnrichment.permissionMode,
@@ -511,18 +796,19 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
-  // Learn the model from turn_context (session_meta has none). Backfill it onto
-  // the root input/metadata the first time we see it.
-  private noteModel(record: TranscriptRecord): void {
+  // Learn the scope's model from turn_context (session_meta has none). Backfill
+  // it onto the scope's parent span input/metadata the first time we see it.
+  private noteModel(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const model = typeof payload.model === "string" ? payload.model : undefined;
-    if (model === undefined || this.model !== undefined) return;
-    this.model = model;
-    if (this.rootSpan !== null) {
+    if (model === undefined || scope.model !== undefined) return;
+    scope.model = model;
+    const parent = scope.parentSpan();
+    if (parent !== null) {
       try {
-        this.rootSpan.log({ input: { model }, metadata: { model } });
+        parent.log({ input: { model }, metadata: { model } });
       } catch (err) {
-        this.logger.error("codex processor: failed to backfill model on root", {
+        this.logger.error("codex processor: failed to backfill model", {
           queueId: this.queueId,
           error: String(err),
         });
@@ -530,10 +816,11 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
-  // Open a turn span on task_started, child of the root, keyed by turn_id.
-  private startTurnSpan(record: TranscriptRecord): void {
-    if (this.rootSpan === null) {
-      this.logger.warn("codex processor: task_started without a root span; ignoring", {
+  // Open a turn span on task_started, child of the scope's parent, by turn_id.
+  private startTurnSpan(scope: TranscriptScope, record: TranscriptRecord): void {
+    const parent = scope.parentSpan();
+    if (parent === null) {
+      this.logger.warn("codex processor: task_started without a parent span; ignoring", {
         queueId: this.queueId,
       });
       return;
@@ -546,7 +833,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    if (this.openTurns.has(turnId)) {
+    if (scope.openTurns.has(turnId)) {
       this.logger.warn("codex processor: duplicate turn_id; keeping existing turn span", {
         queueId: this.queueId,
         turnId,
@@ -555,13 +842,13 @@ export class CodexEventProcessor implements EventProcessor {
     }
     const startTime = isoToUnixSeconds(record.timestamp);
     try {
-      const turnSpan = this.rootSpan.startSpan({
+      const turnSpan = parent.startSpan({
         name: `turn: ${turnId}`,
         type: "task",
         ...(startTime !== undefined ? { startTime } : {}),
-        event: { metadata: { turn_id: turnId, model: this.model } },
+        event: { metadata: { turn_id: turnId, model: scope.model } },
       });
-      this.openTurns.set(turnId, turnSpan);
+      scope.openTurns.set(turnId, turnSpan);
       this.logger.info("codex processor: opened turn span", {
         queueId: this.queueId,
         turnId,
@@ -578,8 +865,8 @@ export class CodexEventProcessor implements EventProcessor {
 
   // Set the open turn's input from a user_message event (the prompt). The
   // user_message carries no turn_id, so it applies to the most recently opened
-  // still-open turn.
-  private setTurnInput(record: TranscriptRecord): void {
+  // still-open turn in this scope.
+  private setTurnInput(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const prompt = typeof payload.message === "string" ? payload.message : undefined;
     if (prompt === undefined) return;
@@ -587,7 +874,7 @@ export class CodexEventProcessor implements EventProcessor {
     // prompt also arrives as a response_item user message (handleMessageItem),
     // which is the canonical source for history. This event only sets the turn's
     // input for display.
-    const turnSpan = this.latestOpenTurn();
+    const turnSpan = this.latestOpenTurn(scope);
     if (turnSpan === undefined) {
       this.logger.debug("codex processor: user_message with no open turn span", {
         queueId: this.queueId,
@@ -606,7 +893,7 @@ export class CodexEventProcessor implements EventProcessor {
 
   // Close the turn span on task_complete, recording the final assistant message
   // as output. Also closes any tool spans still open under that turn.
-  private endTurnSpan(record: TranscriptRecord): void {
+  private endTurnSpan(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const turnId = typeof payload.turn_id === "string" ? payload.turn_id : undefined;
     const output =
@@ -617,7 +904,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    const turnSpan = this.openTurns.get(turnId);
+    const turnSpan = scope.openTurns.get(turnId);
     if (turnSpan === undefined) {
       this.logger.debug("codex processor: task_complete with no open turn span", {
         queueId: this.queueId,
@@ -629,12 +916,12 @@ export class CodexEventProcessor implements EventProcessor {
     // Backstop: close any spans still open without their own closing record
     // (a trailing model call with no token_count, or a tool with no output) at
     // the turn's end time.
-    this.endOpenLlmSpan(endTime);
-    this.endOpenToolSpansForTurn(turnId, endTime);
+    this.endOpenLlmSpan(scope, endTime);
+    this.endOpenToolSpansForTurn(scope, turnId, endTime);
     try {
       turnSpan.log({ output });
       turnSpan.end(endTime !== undefined ? { endTime } : undefined);
-      if (endTime !== undefined) this.lastTurnEndTime = endTime;
+      if (endTime !== undefined) scope.lastTurnEndTime = endTime;
       this.logger.info("codex processor: ended turn span", { queueId: this.queueId, turnId });
     } catch (err) {
       this.logger.error("codex processor: failed to end turn span", {
@@ -643,8 +930,8 @@ export class CodexEventProcessor implements EventProcessor {
         error: String(err),
       });
     } finally {
-      this.openTurns.delete(turnId);
-      this.turnsAwaitingCompletion.delete(turnId);
+      scope.openTurns.delete(turnId);
+      scope.turnsAwaitingCompletion.delete(turnId);
     }
   }
 
@@ -659,30 +946,30 @@ export class CodexEventProcessor implements EventProcessor {
   // output, and its input is the conversation reconstructed up to the open.
   // ==========================================================================
 
-  // Ensure an LLM span is open for the current model call, opening one (child of
-  // the active turn) on first use with input = the conversation so far.
-  private ensureLlmSpan(record: TranscriptRecord): void {
-    if (this.openLlm !== null) return;
-    const turnSpan = this.latestOpenTurn();
+  // Ensure an LLM span is open for the scope's current model call, opening one
+  // (child of the active turn) on first use with input = the conversation so far.
+  private ensureLlmSpan(scope: TranscriptScope, record: TranscriptRecord): void {
+    if (scope.openLlm !== null) return;
+    const turnSpan = this.latestOpenTurn(scope);
     if (turnSpan === undefined) {
       this.logger.debug("codex processor: model output with no open turn; skipping llm span", {
         queueId: this.queueId,
       });
       return;
     }
-    const turnId = this.latestOpenTurnId();
+    const turnId = this.latestOpenTurnId(scope);
     const startTime = isoToUnixSeconds(record.timestamp);
     // Snapshot the conversation as this call's input (the transcript doesn't log
     // the real request, so this is a best-effort reconstruction).
-    const input = this.conversationHistory.map((item) => ({ ...item }));
+    const input = scope.conversationHistory.map((item) => ({ ...item }));
     try {
       const span = turnSpan.startSpan({
-        name: this.model ?? "llm",
+        name: scope.model ?? "llm",
         type: "llm",
         ...(startTime !== undefined ? { startTime } : {}),
-        event: { input, metadata: { model: this.model, turn_id: turnId } },
+        event: { input, metadata: { model: scope.model, turn_id: turnId } },
       });
-      this.openLlm = { span, turnId, output: [] };
+      scope.openLlm = { span, turnId, output: [] };
       this.logger.info("codex processor: opened llm span", {
         queueId: this.queueId,
         turnId,
@@ -700,7 +987,7 @@ export class CodexEventProcessor implements EventProcessor {
   // (opens/feeds the LLM span); user/developer messages are input context. All
   // are appended to conversation history as chat messages for reconstructing
   // later calls' inputs.
-  private handleMessageItem(record: TranscriptRecord): void {
+  private handleMessageItem(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const rawRole = typeof payload.role === "string" ? payload.role : "user";
     const role: ChatMessage["role"] =
@@ -710,30 +997,30 @@ export class CodexEventProcessor implements EventProcessor {
 
     const msg: ChatMessage = { role, content: text };
     if (role === "assistant") {
-      this.ensureLlmSpan(record);
-      this.openLlm?.output.push(msg);
+      this.ensureLlmSpan(scope, record);
+      scope.openLlm?.output.push(msg);
     }
-    this.conversationHistory.push(msg);
+    scope.conversationHistory.push(msg);
   }
 
   // Handle a reasoning item: it belongs to the current model call but its raw
   // content is encrypted/opaque, so we only use it to ensure the LLM span is
   // open. (No readable text to surface here.)
-  private handleReasoningItem(record: TranscriptRecord): void {
-    this.ensureLlmSpan(record);
+  private handleReasoningItem(scope: TranscriptScope, record: TranscriptRecord): void {
+    this.ensureLlmSpan(scope, record);
   }
 
   // Close the current LLM call on a token_count (the segment boundary): end the
   // LLM span with token-usage metrics and its accumulated output. (Tool spans
   // are opened/closed by their own records, so nothing to flush here.)
-  private closeLlmSpan(record: TranscriptRecord): void {
-    if (this.openLlm === null) return;
+  private closeLlmSpan(scope: TranscriptScope, record: TranscriptRecord): void {
+    if (scope.openLlm === null) return;
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const info = (payload.info ?? {}) as Record<string, unknown>;
     const usage = (info.last_token_usage ?? {}) as Record<string, unknown>;
     const metrics = tokenMetrics(usage);
     const endTime = isoToUnixSeconds(record.timestamp);
-    const { span, output } = this.openLlm;
+    const { span, output } = scope.openLlm;
     try {
       span.log({ output: llmOutput(output), metrics });
       span.end(endTime !== undefined ? { endTime } : undefined);
@@ -744,14 +1031,14 @@ export class CodexEventProcessor implements EventProcessor {
         error: String(err),
       });
     } finally {
-      this.openLlm = null;
+      scope.openLlm = null;
     }
   }
 
   // End any open LLM span without a closing token_count (e.g. on turn/root end).
-  private endOpenLlmSpan(endTime: number | undefined): void {
-    if (this.openLlm === null) return;
-    const { span, output } = this.openLlm;
+  private endOpenLlmSpan(scope: TranscriptScope, endTime: number | undefined): void {
+    if (scope.openLlm === null) return;
+    const { span, output } = scope.openLlm;
     try {
       if (output.length > 0) span.log({ output: llmOutput(output) });
       span.end(endTime !== undefined ? { endTime } : undefined);
@@ -761,7 +1048,7 @@ export class CodexEventProcessor implements EventProcessor {
         error: String(err),
       });
     } finally {
-      this.openLlm = null;
+      scope.openLlm = null;
     }
   }
 
@@ -770,12 +1057,20 @@ export class CodexEventProcessor implements EventProcessor {
   // closed by its own records (no cross-segment buffering), which keeps it robust
   // against the transcript being read in pieces. Tool spans are ordered by their
   // transcript start time, so they render between the LLM calls around them.
-  private startToolSpan(record: TranscriptRecord): void {
+  private startToolSpan(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
-    const name = typeof payload.name === "string" ? payload.name : undefined;
+    // Most tool calls carry `name`; some (e.g. tool_search_call) don't, so fall
+    // back to the record subtype with the "_call" suffix stripped.
+    const ptype = typeof payload.type === "string" ? payload.type : undefined;
+    const name =
+      typeof payload.name === "string"
+        ? payload.name
+        : ptype !== undefined
+          ? ptype.replace(/_call$/, "")
+          : undefined;
     const meta = (payload.metadata ?? {}) as Record<string, unknown>;
-    const turnId = typeof meta.turn_id === "string" ? meta.turn_id : this.latestOpenTurnId();
+    const turnId = typeof meta.turn_id === "string" ? meta.turn_id : this.latestOpenTurnId(scope);
     // function_call uses `arguments` (a JSON string); custom_tool_call uses `input`.
     const input = payload.arguments ?? payload.input;
 
@@ -794,8 +1089,8 @@ export class CodexEventProcessor implements EventProcessor {
         },
       ],
     };
-    this.openLlm?.output.push(toolCallMsg);
-    this.conversationHistory.push(toolCallMsg);
+    scope.openLlm?.output.push(toolCallMsg);
+    scope.conversationHistory.push(toolCallMsg);
 
     if (callId === undefined) {
       this.logger.warn("codex processor: tool call without call_id; skipping tool span", {
@@ -811,7 +1106,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    const turnSpan = this.openTurns.get(turnId);
+    const turnSpan = scope.openTurns.get(turnId);
     if (turnSpan === undefined) {
       this.logger.warn("codex processor: tool call with no open turn span; skipping", {
         queueId: this.queueId,
@@ -820,7 +1115,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    if (this.openTools.has(callId)) {
+    if (scope.openTools.has(callId)) {
       this.logger.warn("codex processor: duplicate call_id; keeping existing tool span", {
         queueId: this.queueId,
         callId,
@@ -838,7 +1133,14 @@ export class CodexEventProcessor implements EventProcessor {
           metadata: { tool_name: name, call_id: callId, turn_id: turnId },
         },
       });
-      this.openTools.set(callId, { span: toolSpan, turnId });
+      scope.openTools.set(callId, { span: toolSpan, turnId });
+      // Remember spawn_agent tool spans (main scope only) so a subagent's root
+      // span can be nested under the tool that launched it. The agent_id is not
+      // in the transcript; it arrives on the spawn_agent PostToolUse hook, which
+      // we map to this span by call_id.
+      if (scope.kind === "main" && name === SPAWN_AGENT_TOOL) {
+        this.spawnToolSpansByCallId.set(callId, toolSpan);
+      }
       this.logger.info("codex processor: opened tool span", {
         queueId: this.queueId,
         turnId,
@@ -857,11 +1159,11 @@ export class CodexEventProcessor implements EventProcessor {
 
   // Close the tool span matching a *_output record's call_id, recording the
   // output, and add the result to conversation history as a `tool` message.
-  private endToolSpan(record: TranscriptRecord): void {
+  private endToolSpan(scope: TranscriptScope, record: TranscriptRecord): void {
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const callId = typeof payload.call_id === "string" ? payload.call_id : undefined;
     const output = payload.output ?? payload.result;
-    this.conversationHistory.push({
+    scope.conversationHistory.push({
       role: "tool",
       content: typeof output === "string" ? output : JSON.stringify(output ?? null),
       tool_call_id: callId ?? "",
@@ -872,7 +1174,7 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    const entry = this.openTools.get(callId);
+    const entry = scope.openTools.get(callId);
     if (entry === undefined) {
       this.logger.debug("codex processor: tool output with no open tool span", {
         queueId: this.queueId,
@@ -892,14 +1194,18 @@ export class CodexEventProcessor implements EventProcessor {
         error: String(err),
       });
     } finally {
-      this.openTools.delete(callId);
+      scope.openTools.delete(callId);
     }
   }
 
   // End any still-open tool spans owned by the given turn (e.g. a call whose
   // output never arrived) when the turn ends, at the turn's end time.
-  private endOpenToolSpansForTurn(turnId: string, endTime: number | undefined): void {
-    for (const [callId, entry] of this.openTools) {
+  private endOpenToolSpansForTurn(
+    scope: TranscriptScope,
+    turnId: string,
+    endTime: number | undefined,
+  ): void {
+    for (const [callId, entry] of scope.openTools) {
       if (entry.turnId !== turnId) continue;
       try {
         entry.span.end(endTime !== undefined ? { endTime } : undefined);
@@ -911,72 +1217,86 @@ export class CodexEventProcessor implements EventProcessor {
           error: String(err),
         });
       } finally {
-        this.openTools.delete(callId);
+        scope.openTools.delete(callId);
       }
     }
   }
 
-  // The most recently opened turn that is still open (used to attach a
-  // user_message or an LLM span, which carry no turn_id).
-  private latestOpenTurn(): Span | undefined {
-    let last: Span | undefined;
-    for (const span of this.openTurns.values()) last = span;
-    return last;
-  }
-
-  // The turn_id of the most recently opened still-open turn.
-  private latestOpenTurnId(): string | undefined {
-    let last: string | undefined;
-    for (const turnId of this.openTurns.keys()) last = turnId;
-    return last;
-  }
-
-  // Number of turns whose Stop has fired but which are still open (awaiting
-  // their task_complete). flush() polls only while this is > 0.
-  private countPendingTurns(): number {
-    let n = 0;
-    for (const turnId of this.turnsAwaitingCompletion) {
-      if (this.openTurns.has(turnId)) n += 1;
-    }
-    return n;
-  }
-
-  // End the root span on the first Stop hook. Subsequent Stops are ignored
-  // (the SDK records a span's end time once). `endTime` is the completing turn's
-  // end time so the root isn't stamped with a late wall-clock value; falls back
-  // to the SDK's now() if unknown. Any still-open turn/tool spans are closed at
-  // the same time so nothing dangles.
-  private endRootSpan(endTime: number | undefined): void {
-    if (this.rootSpan === null || this.rootEnded) return;
-    this.rootEnded = true;
-    const endArgs = endTime !== undefined ? { endTime } : undefined;
-    // Backstop: close any open LLM span, any still-open tool spans, then any
-    // still-open turn spans, so nothing dangles.
-    this.endOpenLlmSpan(endTime);
-    for (const [callId, entry] of this.openTools) {
+  // Close every still-open tool span in a scope (used when ending a subagent or
+  // the root). Clears the scope's openTools.
+  private closeAllOpenTools(
+    scope: TranscriptScope,
+    endArgs: { endTime: number } | undefined,
+  ): void {
+    for (const [callId, entry] of scope.openTools) {
       try {
         entry.span.end(endArgs);
       } catch (err) {
-        this.logger.error("codex processor: failed to end dangling tool span on root end", {
+        this.logger.error("codex processor: failed to end dangling tool span", {
           queueId: this.queueId,
           callId,
           error: String(err),
         });
       }
     }
-    this.openTools.clear();
-    for (const [turnId, span] of this.openTurns) {
-      try {
-        span.end(endArgs);
-      } catch (err) {
-        this.logger.error("codex processor: failed to end dangling turn span on root end", {
-          queueId: this.queueId,
-          turnId,
-          error: String(err),
-        });
+    scope.openTools.clear();
+  }
+
+  // The most recently opened turn that is still open in this scope (used to
+  // attach a user_message or an LLM span, which carry no turn_id).
+  private latestOpenTurn(scope: TranscriptScope): Span | undefined {
+    let last: Span | undefined;
+    for (const span of scope.openTurns.values()) last = span;
+    return last;
+  }
+
+  // The turn_id of the most recently opened still-open turn in this scope.
+  private latestOpenTurnId(scope: TranscriptScope): string | undefined {
+    let last: string | undefined;
+    for (const turnId of scope.openTurns.keys()) last = turnId;
+    return last;
+  }
+
+  // Number of turns (across all scopes) whose Stop has fired but which are still
+  // open (awaiting their task_complete). flush() polls only while this is > 0.
+  private countPendingTurns(): number {
+    let n = 0;
+    for (const scope of this.scopes.values()) {
+      for (const turnId of scope.turnsAwaitingCompletion) {
+        if (scope.openTurns.has(turnId)) n += 1;
       }
     }
-    this.openTurns.clear();
+    return n;
+  }
+
+  // End the root span on the first main-session Stop. Subsequent Stops are
+  // ignored (the SDK records a span's end time once). `endTime` is the completing
+  // turn's end time so the root isn't stamped with a late wall-clock value; falls
+  // back to the SDK's now() if unknown. Any still-open spans in the main scope
+  // are closed at the same time so nothing dangles.
+  private endRootSpan(endTime: number | undefined): void {
+    if (this.rootSpan === null || this.rootEnded) return;
+    this.rootEnded = true;
+    const endArgs = endTime !== undefined ? { endTime } : undefined;
+    const scope = this.mainScope;
+    // Backstop: close any open LLM span, any still-open tool spans, then any
+    // still-open turn spans in the main scope, so nothing dangles.
+    if (scope !== null) {
+      this.endOpenLlmSpan(scope, endTime);
+      this.closeAllOpenTools(scope, endArgs);
+      for (const [turnId, span] of scope.openTurns) {
+        try {
+          span.end(endArgs);
+        } catch (err) {
+          this.logger.error("codex processor: failed to end dangling turn span on root end", {
+            queueId: this.queueId,
+            turnId,
+            error: String(err),
+          });
+        }
+      }
+      scope.openTurns.clear();
+    }
     try {
       this.rootSpan.end(endArgs);
       this.logger.info("codex processor: ended root span", { queueId: this.queueId });
@@ -993,10 +1313,10 @@ export class CodexEventProcessor implements EventProcessor {
     // Final catch-up: a turn's task_complete can land slightly after its Stop
     // hook fires, so the Stop's bounded wait may miss it and leave the turn open.
     // flush() happens after the terminal Stop's /flush (and on idle/eviction).
-    // Poll the transcript until every open turn has closed (or a bounded timeout
-    // elapses), processing new records as they appear. This processes the
-    // transcript (it does not unilaterally end spans), staying consistent with
-    // "the transcript is the truth".
+    // Poll every scope's transcript until every open turn has closed (or a
+    // bounded timeout elapses), processing new records as they appear. This
+    // processes the transcript (it does not unilaterally end spans), staying
+    // consistent with "the transcript is the truth".
     await this.drainOpenTurns();
     try {
       await this.rootSpan.flush();
@@ -1009,31 +1329,29 @@ export class CodexEventProcessor implements EventProcessor {
     }
   }
 
-  // Read and process new transcript records, retrying on a bounded interval,
-  // until no turn that has seen its Stop is still open (its task_complete can
-  // land seconds after the Stop hook) or the timeout elapses. Always does at
-  // least one read so a task_complete already on disk closes its turn
-  // immediately. Crucially, this does NOT wait for turns that are merely
+  // Read and process new transcript records for every scope, retrying on a
+  // bounded interval, until no turn that has seen its Stop is still open (its
+  // task_complete can land seconds after the Stop hook) or the timeout elapses.
+  // Always does at least one read so a task_complete already on disk closes its
+  // turn immediately. Crucially, this does NOT wait for turns that are merely
   // mid-progress (no Stop yet) — so an idle flush during an active turn returns
-  // promptly instead of blocking. On timeout, leaves whatever is still open for
-  // endRootSpan's backstop to close.
+  // promptly. On timeout, leaves whatever is still open for the backstops.
   private async drainOpenTurns(): Promise<void> {
-    if (this.transcriptPath === null) return;
+    if (this.scopes.size === 0) return;
     const deadline = Date.now() + FLUSH_TIMEOUT_MS;
     for (;;) {
-      try {
-        const { lines, offset } = this.transcriptReader.readFrom(
-          this.transcriptPath,
-          this.transcriptOffset,
-        );
-        this.transcriptOffset = offset;
-        this.consumeLines(lines);
-      } catch (err) {
-        this.logger.error("codex processor: final catch-up read failed", {
-          queueId: this.queueId,
-          error: String(err),
-        });
-        return;
+      for (const scope of this.scopes.values()) {
+        try {
+          const { lines, offset } = this.transcriptReader.readFrom(scope.path, scope.offset);
+          scope.offset = offset;
+          this.consumeLines(scope, lines);
+        } catch (err) {
+          this.logger.error("codex processor: final catch-up read failed", {
+            queueId: this.queueId,
+            path: scope.path,
+            error: String(err),
+          });
+        }
       }
       // Only turns whose Stop has fired but whose task_complete hasn't arrived
       // keep us waiting. (endTurnSpan removes them from both sets as they close.)

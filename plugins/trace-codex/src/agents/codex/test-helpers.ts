@@ -59,6 +59,22 @@ export function stop(data: Record<string, unknown> = {}): EnqueueEvent {
   return codexHook("Stop", { session_id: "session-1", ...data });
 }
 
+export function subagentStart(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("SubagentStart", { session_id: "session-1", ...data });
+}
+
+export function subagentStop(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("SubagentStop", { session_id: "session-1", ...data });
+}
+
+export function preToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("PreToolUse", { session_id: "session-1", ...data });
+}
+
+export function postToolUse(data: Record<string, unknown> = {}): EnqueueEvent {
+  return codexHook("PostToolUse", { session_id: "session-1", ...data });
+}
+
 /** A config event enabling tracing; pass extra reporting config via `data`. */
 export function configEvent(data: Record<string, unknown> = {}): EnqueueEvent {
   return {
@@ -233,6 +249,48 @@ export class FakeTranscriptReader implements TranscriptReader {
     this.readOffsets.push(offset);
     const from = offset > this.buffer.length ? 0 : offset;
     const slice = this.buffer.slice(from);
+    const lines: string[] = [];
+    let consumed = 0;
+    let lineStart = 0;
+    for (let i = 0; i < slice.length; i++) {
+      if (slice[i] === "\n") {
+        lines.push(slice.slice(lineStart, i));
+        lineStart = i + 1;
+        consumed = lineStart;
+      }
+    }
+    return { lines, offset: from + consumed };
+  }
+
+  async waitFor(
+    path: string,
+    offset: number,
+    predicate: (line: string) => boolean,
+    _opts: WaitForOptions,
+  ): Promise<TranscriptWaitResult> {
+    const { lines, offset: next } = this.readFrom(path, offset);
+    const sentinelFound = lines.some(predicate);
+    return { lines, offset: next, sentinelFound };
+  }
+}
+
+/**
+ * A transcript reader backed by multiple in-memory files, keyed by path. Used by
+ * subagent tests, where the main session and each subagent write to separate
+ * transcript files but are read by one processor. `append(path, line)` writes to
+ * a specific file; reads/waits operate per path with independent offsets.
+ */
+export class MultiFileTranscriptReader implements TranscriptReader {
+  private readonly buffers = new Map<string, string>();
+
+  append(path: string, line: string): void {
+    this.buffers.set(path, `${this.buffers.get(path) ?? ""}${line}\n`);
+  }
+
+  readFrom(path: string, offset: number): TranscriptReadResult {
+    const buffer = this.buffers.get(path) ?? "";
+    const from = offset > buffer.length ? 0 : offset;
+    const slice = buffer.slice(from);
     const lines: string[] = [];
     let consumed = 0;
     let lineStart = 0;

@@ -13,10 +13,15 @@ import {
   FakeTranscriptReader,
   functionCall,
   functionCallOutput,
+  MultiFileTranscriptReader,
+  postToolUse,
+  preToolUse,
   reasoning,
   sessionMeta,
   sessionStart,
   stop,
+  subagentStart,
+  subagentStop,
   taskComplete,
   taskStarted,
   tokenCount,
@@ -931,6 +936,149 @@ describe("CodexEventProcessor: transcript catch-up plumbing", () => {
       const turn = tree?.children[0];
       expect(turn?.name).toBe("turn: t1");
       expect(turn?.metrics?.end).toBe(1767225615); // 2026-01-01T00:00:15Z
+    } finally {
+      trace.cleanup();
+    }
+  });
+});
+
+describe("CodexEventProcessor: subagents", () => {
+  const MAIN = "/test/main.jsonl";
+  const SUB = "/test/sub.jsonl";
+
+  // A main session that spawns one subagent. The subagent writes to its own
+  // transcript file; the processor must nest its full hierarchy (subagent root
+  // -> turn -> llm/tool) under the spawn_agent tool span that launched it, and
+  // never let the two files' offsets cross-contaminate.
+  test("a subagent renders as a nested trace under its spawn_agent tool", async () => {
+    const reader = new MultiFileTranscriptReader();
+    const w = (path: string, record: Record<string, unknown>) =>
+      reader.append(path, JSON.stringify(transcript(record).record));
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+      await processor.process(configEvent({ session_id: "s" }));
+
+      // Main session: root + a turn that calls spawn_agent.
+      w(MAIN, { type: "session_meta", payload: { id: "s", cwd: "/work/app" } });
+      w(MAIN, { type: "event_msg", payload: { type: "task_started", turn_id: "main-1" } });
+      w(MAIN, { type: "turn_context", payload: { model: "gpt-5.5" } });
+      w(MAIN, { type: "response_item", payload: { type: "reasoning", summary: [] } });
+      w(MAIN, {
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          call_id: "call_spawn",
+          arguments: "{}",
+          metadata: { turn_id: "main-1" },
+        },
+      });
+      w(MAIN, {
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_spawn", output: "{}" },
+      });
+      w(MAIN, {
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: {} } },
+      });
+      await processor.process(sessionStart({ session_id: "s", transcript_path: MAIN }));
+      await processor.process(
+        preToolUse({
+          session_id: "s",
+          transcript_path: MAIN,
+          tool_name: "spawn_agent",
+          tool_use_id: "call_spawn",
+        }),
+      );
+      // PostToolUse reveals the agent_id; maps it to the spawn tool span.
+      await processor.process(
+        postToolUse({
+          session_id: "s",
+          transcript_path: MAIN,
+          tool_name: "spawn_agent",
+          tool_use_id: "call_spawn",
+          tool_response: JSON.stringify({ agent_id: "agent-1" }),
+        }),
+      );
+
+      // Subagent: its own transcript + lifecycle hooks (carry agent_id).
+      w(SUB, { type: "session_meta", payload: { id: "agent-1" } });
+      w(SUB, { type: "event_msg", payload: { type: "task_started", turn_id: "sub-1" } });
+      w(SUB, { type: "turn_context", payload: { model: "gpt-5.5" } });
+      w(SUB, { type: "response_item", payload: { type: "reasoning", summary: [] } });
+      w(SUB, {
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "exec_command",
+          call_id: "call_exec",
+          arguments: "{}",
+          metadata: { turn_id: "sub-1" },
+        },
+      });
+      w(SUB, {
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_exec", output: "ok" },
+      });
+      w(SUB, {
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: {} } },
+      });
+      w(SUB, {
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "sub-1", last_agent_message: "sub done" },
+      });
+      await processor.process(
+        subagentStart({
+          session_id: "s",
+          transcript_path: SUB,
+          agent_id: "agent-1",
+          agent_type: "default",
+        }),
+      );
+      await processor.process(
+        subagentStop({
+          session_id: "s",
+          transcript_path: MAIN,
+          agent_transcript_path: SUB,
+          agent_id: "agent-1",
+        }),
+      );
+
+      // Main session completes.
+      w(MAIN, {
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "main-1", last_agent_message: "all done" },
+      });
+      await processor.process(stop({ session_id: "s", transcript_path: MAIN, turn_id: "main-1" }));
+      await processor.flush();
+
+      const tree = spansToTree(await trace.drain());
+      expect(tree?.name).toBe("codex: app");
+      const mainTurn = tree?.children.find((c) => c.name === "turn: main-1");
+      expect(mainTurn).toBeDefined();
+
+      // The spawn_agent tool span is under the main turn, and the subagent root
+      // is nested under it (not a sibling of the main turn, not duplicated).
+      const spawn = mainTurn?.children.find((c) => c.name === "spawn_agent");
+      expect(spawn?.type).toBe("tool");
+      const subRoot = spawn?.children.find((c) => c.name === "subagent: agent-1");
+      expect(subRoot).toBeDefined();
+      expect(subRoot?.type).toBe("task");
+
+      const subTurn = subRoot?.children.find((c) => c.name === "turn: sub-1");
+      expect(subTurn).toBeDefined();
+      const exec = subTurn?.children.find((c) => c.name === "exec_command");
+      expect(exec?.type).toBe("tool");
+
+      // No subagent turn leaked to the top level (the original bug).
+      expect(tree?.children.some((c) => c.name === "turn: sub-1")).toBe(false);
     } finally {
       trace.cleanup();
     }
