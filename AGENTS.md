@@ -17,8 +17,9 @@ Key files for the MCP/skills plugin:
 - `plugins/braintrust-codex-plugin/.mcp.json` — MCP server definition
 - `plugins/braintrust-codex-plugin/skills/braintrust/` — agent skills exposed through the plugin
 
-Key files for the tracing plugin:
+Key files for the tracing plugin (see [`plugins/trace-codex/AGENTS.md`](plugins/trace-codex/AGENTS.md) for its architecture):
 
+- `plugins/trace-codex/AGENTS.md` — architecture and contributor guide for this plugin
 - `plugins/trace-codex/.codex-plugin/plugin.json` — plugin manifest
 - `plugins/trace-codex/hooks/hooks.json` — lifecycle hook config
 - `plugins/trace-codex/src/` — the hook client + event server (compiled to `bin/codex-hook`)
