@@ -30,7 +30,7 @@ import type { ReportingConfig, SpanRef } from "../../braintrust/logger.ts";
  * fresh, losing only resume continuity), so we never try to rehydrate state we
  * can't interpret.
  */
-export const SNAPSHOT_SCHEMA_VERSION = 1;
+export const SNAPSHOT_SCHEMA_VERSION = 3;
 
 /** A conversation item (chat message or reasoning), stored verbatim. These are
  * plain JSON already, so they round-trip without transformation. */
@@ -41,6 +41,8 @@ export interface OpenLlmSnapshot {
   span: SpanRef;
   turnId: string | undefined;
   output: ConversationItemSnapshot[];
+  /** Time (Unix seconds) of the call's last model-output item; the span's end. */
+  lastOutputTime: number | undefined;
   outputPreset?: boolean;
 }
 
@@ -51,10 +53,15 @@ export interface OpenToolSnapshot {
   turnId: string;
 }
 
-/** An open turn span (keyed by turn_id in the map). */
+/** An open turn span (keyed by turn_id in the map), plus the timing used to
+ * place its child LLM spans. */
 export interface OpenTurnSnapshot {
   turnId: string;
   span: SpanRef;
+  /** Turn start (Unix seconds), used as the first child's start time. */
+  startTime: number | undefined;
+  /** Max end time (Unix seconds) among the turn's already-ended children. */
+  lastChildEndTime: number | undefined;
 }
 
 /** Pending-subagent info captured before its root span exists. The parent turn

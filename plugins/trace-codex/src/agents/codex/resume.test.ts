@@ -32,7 +32,7 @@ import {
   type TraceEntry,
   taskComplete,
   taskStarted,
-  type transcript,
+  transcript,
   turnContext,
   userMessage,
 } from "./test-helpers.ts";
@@ -309,6 +309,8 @@ describe("CodexEventProcessor: resume from snapshot", () => {
             output: "tool done",
             ended: true,
             children: [
+              // The model call that emitted the tool call opens an llm span.
+              { span_attributes: { name: "gpt-5.5", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "shell", type: "tool" },
                 output: "ok",
@@ -319,6 +321,90 @@ describe("CodexEventProcessor: resume from snapshot", () => {
           },
         ],
       });
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // The per-turn timing used to place LLM spans (turn start + last-child-end)
+  // must survive a restart, so an LLM call that opens AFTER the restart still
+  // starts at the right place (here: the turn's start, since it's the first
+  // child) rather than at its post-restart output record.
+  test("turn timing survives a restart so a resumed llm span starts correctly", async () => {
+    const trace = withCapturedTrace();
+    try {
+      const queueId = "sess-timing";
+      const reader = new FakeTranscriptReader();
+      const store = new MemorySnapshotStore();
+      const deps = { queueId, reader, factory: trace.spanFactory, store };
+
+      // Run 1: the turn opens at :11 but the model hasn't produced output yet when
+      // the server shuts down (no llm span exists yet — only the open turn).
+      await runThrough(
+        [
+          configEvent({ session_id: queueId }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "session_meta",
+            payload: { id: queueId, cwd: "/tmp/proj" },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "turn_context",
+            payload: { model: "gpt-5.5" },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:11Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-1" },
+          }),
+          sessionStart({ session_id: queueId, source: "startup" }),
+          preToolUse({ session_id: queueId }),
+        ],
+        deps,
+      );
+
+      // The open turn's start time was persisted.
+      const snap = store.read(queueId);
+      expect(snap?.scopes[0]?.openTurns[0]?.turnId).toBe("turn-1");
+      expect(snap?.scopes[0]?.openTurns[0]?.startTime).toBe(1767225611);
+
+      // Run 2: a fresh processor. The model output finally lands (:18) and the
+      // call closes (:18). The resumed llm span must start at the turn's start
+      // (:11, restored), not at its output record (:18).
+      await runThrough(
+        [
+          transcript({
+            timestamp: "2026-01-01T00:00:18Z",
+            type: "response_item",
+            payload: {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: "hi" }],
+            },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:18Z",
+            type: "event_msg",
+            payload: { type: "token_count", info: { last_token_usage: { total_tokens: 1 } } },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:19Z",
+            type: "event_msg",
+            payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: "hi" },
+          }),
+          stop({ turn_id: "turn-1" }),
+        ],
+        deps,
+      );
+
+      const spans = await trace.drain();
+      const tree = spansToTree(spans);
+      const turn = tree?.children.find((c) => c.name === "turn: turn-1");
+      const llm = turn?.children.find((c) => c.name === "gpt-5.5" || c.name === "llm");
+      // Started at the restored turn start (:11), ended at token_count (:18).
+      expect(llm?.metrics?.start).toBe(1767225611);
+      expect(llm?.metrics?.end).toBe(1767225618);
     } finally {
       trace.cleanup();
     }

@@ -187,11 +187,39 @@ interface OpenLlm {
   /** Items produced by this call: reasoning, assistant text, and/or tool calls. */
   output: ConversationItem[];
   /**
+   * Timestamp (Unix seconds) of this call's last model-output item (message /
+   * reasoning / tool call). This is when the model finished generating and is
+   * used as the span's end time — NOT the closing token_count's timestamp. Codex
+   * writes the token_count after the tool result (at the same instant as the
+   * tool output), so ending the span there would wrongly stretch it to swallow
+   * the tool's execution. The token_count only supplies token metrics.
+   */
+  lastOutputTime: number | undefined;
+  /**
    * When true, the span's output was already set at creation (e.g. a compaction
    * call, whose output is the replacement history), so closing it must not
    * overwrite it with the accumulated `output` messages.
    */
   outputPreset?: boolean;
+}
+
+/**
+ * An open turn span plus the timing we need to place its child LLM spans. The
+ * transcript records a model call's output only when it lands (just before the
+ * call's token_count), with no record at request-send time — so an LLM span
+ * stamped from its first output item would look near-instant. Instead we start
+ * each LLM span at the end of the most recently-ended child of this turn
+ * (`lastChildEndTime`), or at the turn's own start (`startTime`) when it's the
+ * first child. That makes a call's span cover request→response, and consecutive
+ * children tile the turn. All per-turn (hence per-scope), so concurrent
+ * subagents never affect each other's timing.
+ */
+interface OpenTurn {
+  span: Span;
+  /** Turn start (Unix seconds), used as the first child's start time. */
+  startTime: number | undefined;
+  /** Max end time (Unix seconds) among this turn's already-ended children. */
+  lastChildEndTime: number | undefined;
 }
 
 /**
@@ -215,8 +243,9 @@ interface TranscriptScope {
   readonly parentSpan: () => Span | null;
   /** Byte offset already consumed from `path`. */
   offset: number;
-  /** Turn spans currently open in this scope, keyed by turn_id. */
-  readonly openTurns: Map<string, Span>;
+  /** Turn spans currently open in this scope, keyed by turn_id (with the timing
+   * used to place their child LLM spans). */
+  readonly openTurns: Map<string, OpenTurn>;
   /** turn_ids whose Stop has fired but whose task_complete hasn't been seen. */
   readonly turnsAwaitingCompletion: Set<string>;
   /** OpenAI-style chat history (messages + reasoning), used to reconstruct each
@@ -822,9 +851,9 @@ export class CodexEventProcessor implements EventProcessor {
     const endArgs = endTime !== undefined ? { endTime } : undefined;
     this.endOpenLlmSpan(scope, endTime);
     this.closeAllOpenTools(scope, endArgs);
-    for (const [, span] of scope.openTurns) {
+    for (const [, turn] of scope.openTurns) {
       try {
-        span.end(endArgs);
+        turn.span.end(endArgs);
       } catch (err) {
         this.logger.error("codex processor: failed to end dangling subagent turn span", {
           queueId: this.queueId,
@@ -1098,7 +1127,7 @@ export class CodexEventProcessor implements EventProcessor {
         turnName,
         "task",
       );
-      scope.openTurns.set(turnId, turnSpan);
+      scope.openTurns.set(turnId, { span: turnSpan, startTime, lastChildEndTime: undefined });
       this.logger.info("codex processor: opened turn span", {
         queueId: this.queueId,
         turnId,
@@ -1122,13 +1151,14 @@ export class CodexEventProcessor implements EventProcessor {
   // did: the conversation before it (input) and the kept context after (output).
   private handleCompacted(scope: TranscriptScope, record: TranscriptRecord): void {
     const turnId = this.latestOpenTurnId(scope);
-    const turnSpan = this.latestOpenTurn(scope);
-    if (turnId === undefined || turnSpan === undefined) {
+    const turn = this.latestOpenTurn(scope);
+    if (turnId === undefined || turn === undefined) {
       this.logger.debug("codex processor: compacted record with no open turn span", {
         queueId: this.queueId,
       });
       return;
     }
+    const turnSpan = turn.span;
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const replacement = Array.isArray(payload.replacement_history)
       ? (payload.replacement_history as unknown[])
@@ -1169,7 +1199,10 @@ export class CodexEventProcessor implements EventProcessor {
     //            clear marker for the summary, which Codex stores encrypted and
     //            does not expose to us.
     // Closed by the turn's token_count (metrics) like any other model call.
-    const startTime = isoToUnixSeconds(record.timestamp);
+    // Start the span at the turn's start (compaction is the sole child), not the
+    // record timestamp (which is when the compaction result lands), so its
+    // duration reflects the compaction call rather than looking instant.
+    const startTime = this.llmStartTimeFor(turn) ?? isoToUnixSeconds(record.timestamp);
     const before = scope.conversationHistory.map((item) => ({ ...item }));
     const output = compactionOutput(replacement);
     const compactionLlmName = scope.model ?? "compaction";
@@ -1190,8 +1223,16 @@ export class CodexEventProcessor implements EventProcessor {
       );
       // Reuse the open-llm slot so the turn's token_count closes it with usage.
       // outputPreset: the replacement history is already logged as the output, so
-      // the closing token_count must not overwrite it.
-      scope.openLlm = { span, turnId, output: [], outputPreset: true };
+      // the closing token_count must not overwrite it. lastOutputTime is the
+      // compacted record's time (when the compaction output landed); the closing
+      // token_count provides metrics only.
+      scope.openLlm = {
+        span,
+        turnId,
+        output: [],
+        outputPreset: true,
+        lastOutputTime: isoToUnixSeconds(record.timestamp),
+      };
     } catch (err) {
       this.logger.error("codex processor: failed to open compaction llm span", {
         queueId: this.queueId,
@@ -1229,15 +1270,15 @@ export class CodexEventProcessor implements EventProcessor {
     // prompt also arrives as a response_item user message (handleMessageItem),
     // which is the canonical source for history. This event only sets the turn's
     // input for display.
-    const turnSpan = this.latestOpenTurn(scope);
-    if (turnSpan === undefined) {
+    const turn = this.latestOpenTurn(scope);
+    if (turn === undefined) {
       this.logger.debug("codex processor: user_message with no open turn span", {
         queueId: this.queueId,
       });
       return;
     }
     try {
-      turnSpan.log({ input: prompt });
+      turn.span.log({ input: prompt });
     } catch (err) {
       this.logger.error("codex processor: failed to set turn input", {
         queueId: this.queueId,
@@ -1259,14 +1300,15 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    const turnSpan = scope.openTurns.get(turnId);
-    if (turnSpan === undefined) {
+    const turn = scope.openTurns.get(turnId);
+    if (turn === undefined) {
       this.logger.debug("codex processor: task_complete with no open turn span", {
         queueId: this.queueId,
         turnId,
       });
       return;
     }
+    const turnSpan = turn.span;
     const endTime = isoToUnixSeconds(record.timestamp);
     // Backstop: close any spans still open without their own closing record
     // (a trailing model call with no token_count, or a tool with no output) at
@@ -1305,22 +1347,26 @@ export class CodexEventProcessor implements EventProcessor {
   // (child of the active turn) on first use with input = the conversation so far.
   private ensureLlmSpan(scope: TranscriptScope, record: TranscriptRecord): void {
     if (scope.openLlm !== null) return;
-    const turnSpan = this.latestOpenTurn(scope);
-    if (turnSpan === undefined) {
+    const turn = this.latestOpenTurn(scope);
+    if (turn === undefined) {
       this.logger.debug("codex processor: model output with no open turn; skipping llm span", {
         queueId: this.queueId,
       });
       return;
     }
     const turnId = this.latestOpenTurnId(scope);
-    const startTime = isoToUnixSeconds(record.timestamp);
+    // Start the span where the model's work for this call actually began — the
+    // end of the turn's most recently-ended child, or the turn's start when this
+    // is the first child — NOT the record timestamp (which is when the model's
+    // output landed, just before its token_count, yielding a near-instant span).
+    const startTime = this.llmStartTimeFor(turn) ?? isoToUnixSeconds(record.timestamp);
     // Snapshot the conversation as this call's input (the transcript doesn't log
     // the real request, so this is a best-effort reconstruction).
     const input = scope.conversationHistory.map((item) => ({ ...item }));
     const llmName = scope.model ?? "llm";
     try {
       const span = this.trackSpan(
-        turnSpan.startSpan({
+        turn.span.startSpan({
           name: llmName,
           type: "llm",
           ...(startTime !== undefined ? { startTime } : {}),
@@ -1329,7 +1375,7 @@ export class CodexEventProcessor implements EventProcessor {
         llmName,
         "llm",
       );
-      scope.openLlm = { span, turnId, output: [] };
+      scope.openLlm = { span, turnId, output: [], lastOutputTime: startTime };
       this.logger.info("codex processor: opened llm span", {
         queueId: this.queueId,
         turnId,
@@ -1340,6 +1386,19 @@ export class CodexEventProcessor implements EventProcessor {
         queueId: this.queueId,
         error: String(err),
       });
+    }
+  }
+
+  // Record that the open LLM call produced an output item at `record`'s time,
+  // advancing its lastOutputTime. The LLM span ends at this time (when the model
+  // last generated), not at the closing token_count (which Codex writes after
+  // the tool result). No-op if no LLM span is open.
+  private noteLlmOutputTime(scope: TranscriptScope, record: TranscriptRecord): void {
+    if (scope.openLlm === null) return;
+    const t = isoToUnixSeconds(record.timestamp);
+    if (t === undefined) return;
+    if (scope.openLlm.lastOutputTime === undefined || t > scope.openLlm.lastOutputTime) {
+      scope.openLlm.lastOutputTime = t;
     }
   }
 
@@ -1359,6 +1418,7 @@ export class CodexEventProcessor implements EventProcessor {
     if (role === "assistant") {
       this.ensureLlmSpan(scope, record);
       scope.openLlm?.output.push(msg);
+      this.noteLlmOutputTime(scope, record);
     }
     scope.conversationHistory.push(msg);
   }
@@ -1370,6 +1430,9 @@ export class CodexEventProcessor implements EventProcessor {
   // encrypted, so items with no readable summary only open the span.
   private handleReasoningItem(scope: TranscriptScope, record: TranscriptRecord): void {
     this.ensureLlmSpan(scope, record);
+    // The reasoning item is a model output at this time, even when its summary is
+    // encrypted (empty) and adds nothing readable — so advance the span's end.
+    this.noteLlmOutputTime(scope, record);
     const payload = (record.payload ?? {}) as Record<string, unknown>;
     const summary = reasoningSummary(payload.summary);
     if (summary === undefined) return;
@@ -1387,11 +1450,20 @@ export class CodexEventProcessor implements EventProcessor {
     const info = (payload.info ?? {}) as Record<string, unknown>;
     const usage = (info.last_token_usage ?? {}) as Record<string, unknown>;
     const metrics = tokenMetrics(usage);
-    const endTime = isoToUnixSeconds(record.timestamp);
-    const { span, output, outputPreset } = scope.openLlm;
+    const { span, turnId, output, outputPreset, lastOutputTime } = scope.openLlm;
+    // End the span when the model last generated (its last output item), NOT at
+    // this token_count: Codex writes the token_count after the tool result (at
+    // the same instant as the tool output), so using it would stretch the span to
+    // swallow the tool's execution — making the llm span overlap the tool it
+    // called, which is causally impossible. The token_count only supplies metrics.
+    // Fall back to the token_count time if we somehow have no output time.
+    const endTime = lastOutputTime ?? isoToUnixSeconds(record.timestamp);
     try {
       span.log(outputPreset ? { metrics } : { output: llmOutput(output), metrics });
       span.end(endTime !== undefined ? { endTime } : undefined);
+      // This LLM call is a child of its turn; advance the turn's boundary so the
+      // next child (LLM or tool) starts where this one ended (its last output).
+      this.noteChildEnded(scope, turnId, endTime);
       this.logger.info("codex processor: ended llm span", { queueId: this.queueId });
     } catch (err) {
       this.logger.error("codex processor: failed to end llm span", {
@@ -1404,12 +1476,17 @@ export class CodexEventProcessor implements EventProcessor {
   }
 
   // End any open LLM span without a closing token_count (e.g. on turn/root end).
+  // Prefer the model's last-output time (when generation actually ended) over the
+  // caller's fallback endTime (the turn/root end), so a trailing call isn't
+  // stretched to the turn boundary.
   private endOpenLlmSpan(scope: TranscriptScope, endTime: number | undefined): void {
     if (scope.openLlm === null) return;
-    const { span, output } = scope.openLlm;
+    const { span, turnId, output, lastOutputTime } = scope.openLlm;
+    const effectiveEnd = lastOutputTime ?? endTime;
     try {
       if (output.length > 0) span.log({ output: llmOutput(output) });
-      span.end(endTime !== undefined ? { endTime } : undefined);
+      span.end(effectiveEnd !== undefined ? { endTime: effectiveEnd } : undefined);
+      this.noteChildEnded(scope, turnId, effectiveEnd);
     } catch (err) {
       this.logger.error("codex processor: failed to end dangling llm span", {
         queueId: this.queueId,
@@ -1442,9 +1519,9 @@ export class CodexEventProcessor implements EventProcessor {
     // function_call uses `arguments` (a JSON string); custom_tool_call uses `input`.
     const input = payload.arguments ?? payload.input;
 
-    // A tool call is part of the assistant's response: record it as an assistant
-    // message carrying a tool_call, both in the open LLM call's output and in the
-    // conversation history (input context for later calls).
+    // Record the tool call as an assistant message carrying a tool_call in the
+    // conversation history (input context for later calls). Done regardless of
+    // whether we end up creating a span, so reconstructed history stays faithful.
     const argsString = typeof input === "string" ? input : JSON.stringify(input ?? {});
     const toolCallMsg: ChatMessage = {
       role: "assistant",
@@ -1457,7 +1534,6 @@ export class CodexEventProcessor implements EventProcessor {
         },
       ],
     };
-    scope.openLlm?.output.push(toolCallMsg);
     scope.conversationHistory.push(toolCallMsg);
 
     if (callId === undefined) {
@@ -1474,8 +1550,8 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
-    const turnSpan = scope.openTurns.get(turnId);
-    if (turnSpan === undefined) {
+    const turn = scope.openTurns.get(turnId);
+    if (turn === undefined) {
       this.logger.warn("codex processor: tool call with no open turn span; skipping", {
         queueId: this.queueId,
         turnId,
@@ -1483,6 +1559,19 @@ export class CodexEventProcessor implements EventProcessor {
       });
       return;
     }
+    const turnSpan = turn.span;
+
+    // A tool call IS a model output, so it belongs to the current LLM call. Open
+    // the LLM span if one isn't already open (a call whose only output is a tool
+    // call — no preceding assistant message or readable reasoning — would
+    // otherwise leave the model's work, often many seconds, with no llm span,
+    // appearing as an unaccounted gap at the front of the turn). Record the tool
+    // call as this LLM call's output too. Done only once we know the tool call is
+    // valid (real open turn), so a tool call for an unknown turn opens nothing.
+    this.ensureLlmSpan(scope, record);
+    scope.openLlm?.output.push(toolCallMsg);
+    // The model emitted this tool call now — that's when its generation ended.
+    this.noteLlmOutputTime(scope, record);
     if (scope.openTools.has(callId)) {
       this.logger.warn("codex processor: duplicate call_id; keeping existing tool span", {
         queueId: this.queueId,
@@ -1563,6 +1652,9 @@ export class CodexEventProcessor implements EventProcessor {
     try {
       entry.span.log({ output });
       entry.span.end(endTime !== undefined ? { endTime } : undefined);
+      // A tool is a child of its turn; advance the turn's boundary so a following
+      // LLM call (the model resuming after the tool result) starts here.
+      this.noteChildEnded(scope, entry.turnId, endTime);
       this.logger.info("codex processor: ended tool span", { queueId: this.queueId, callId });
     } catch (err) {
       this.logger.error("codex processor: failed to end tool span", {
@@ -1621,10 +1713,35 @@ export class CodexEventProcessor implements EventProcessor {
 
   // The most recently opened turn that is still open in this scope (used to
   // attach a user_message or an LLM span, which carry no turn_id).
-  private latestOpenTurn(scope: TranscriptScope): Span | undefined {
-    let last: Span | undefined;
-    for (const span of scope.openTurns.values()) last = span;
+  private latestOpenTurn(scope: TranscriptScope): OpenTurn | undefined {
+    let last: OpenTurn | undefined;
+    for (const turn of scope.openTurns.values()) last = turn;
     return last;
+  }
+
+  // The start time (Unix seconds) to use for an LLM span opening now under the
+  // given turn: the end of the turn's most recently-ended child if any, else the
+  // turn's own start. This makes the LLM span cover request->response (the
+  // transcript has no record at request-send time) and lets consecutive children
+  // tile the turn. Per-turn state, so concurrent subagents never interfere.
+  private llmStartTimeFor(turn: OpenTurn): number | undefined {
+    return turn.lastChildEndTime ?? turn.startTime;
+  }
+
+  // Record that a child of the given turn ended at `endTime`, advancing the
+  // turn's lastChildEndTime so the next LLM span starts where this child ended.
+  // No-op when endTime is unknown or the turn isn't open.
+  private noteChildEnded(
+    scope: TranscriptScope,
+    turnId: string | undefined,
+    endTime: number | undefined,
+  ): void {
+    if (turnId === undefined || endTime === undefined) return;
+    const turn = scope.openTurns.get(turnId);
+    if (turn === undefined) return;
+    if (turn.lastChildEndTime === undefined || endTime > turn.lastChildEndTime) {
+      turn.lastChildEndTime = endTime;
+    }
   }
 
   // The turn_id of the most recently opened still-open turn in this scope.
@@ -1661,9 +1778,9 @@ export class CodexEventProcessor implements EventProcessor {
     if (scope !== null) {
       this.endOpenLlmSpan(scope, endTime);
       this.closeAllOpenTools(scope, endArgs);
-      for (const [turnId, span] of scope.openTurns) {
+      for (const [turnId, turn] of scope.openTurns) {
         try {
-          span.end(endArgs);
+          turn.span.end(endArgs);
         } catch (err) {
           this.logger.error("codex processor: failed to end dangling turn span on root end", {
             queueId: this.queueId,
@@ -1803,9 +1920,11 @@ export class CodexEventProcessor implements EventProcessor {
         path: scope.path,
         kind: scope.kind,
         offset: scope.offset,
-        openTurns: Array.from(scope.openTurns, ([turnId, span]) => ({
+        openTurns: Array.from(scope.openTurns, ([turnId, turn]) => ({
           turnId,
-          span: this.refFor(span),
+          span: this.refFor(turn.span),
+          startTime: turn.startTime,
+          lastChildEndTime: turn.lastChildEndTime,
         })),
         turnsAwaitingCompletion: Array.from(scope.turnsAwaitingCompletion),
         conversationHistory: toItemSnapshots(scope.conversationHistory),
@@ -1816,6 +1935,7 @@ export class CodexEventProcessor implements EventProcessor {
                 span: this.refFor(scope.openLlm.span),
                 turnId: scope.openLlm.turnId,
                 output: toItemSnapshots(scope.openLlm.output),
+                lastOutputTime: scope.openLlm.lastOutputTime,
                 outputPreset: scope.openLlm.outputPreset,
               },
         openTools: Array.from(scope.openTools, ([callId, entry]) => ({
@@ -1914,7 +2034,16 @@ export class CodexEventProcessor implements EventProcessor {
         kind: s.kind,
         parentSpan: isMain ? () => this.rootSpan : () => scope.subagentRootSpan,
         offset: s.offset,
-        openTurns: new Map(s.openTurns.map((t) => [t.turnId, rehydrate(t.span)])),
+        openTurns: new Map(
+          s.openTurns.map((t) => [
+            t.turnId,
+            {
+              span: rehydrate(t.span),
+              startTime: t.startTime,
+              lastChildEndTime: t.lastChildEndTime,
+            },
+          ]),
+        ),
         turnsAwaitingCompletion: new Set(s.turnsAwaitingCompletion),
         conversationHistory: fromItemSnapshots(s.conversationHistory),
         openLlm:
@@ -1924,6 +2053,7 @@ export class CodexEventProcessor implements EventProcessor {
                 span: rehydrate(s.openLlm.span),
                 turnId: s.openLlm.turnId,
                 output: fromItemSnapshots(s.openLlm.output),
+                lastOutputTime: s.openLlm.lastOutputTime,
                 outputPreset: s.openLlm.outputPreset,
               },
         openTools: new Map(

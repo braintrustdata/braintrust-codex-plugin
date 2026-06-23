@@ -207,7 +207,10 @@ describe("CodexEventProcessor: turn spans", () => {
             span_attributes: { name: "turn: t2", type: "task" },
             output: "second",
             ended: true,
-            children: [{ span_attributes: { name: "exec_command", type: "tool" }, ended: true }],
+            children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
+              { span_attributes: { name: "exec_command", type: "tool" }, ended: true },
+            ],
           },
         ],
       },
@@ -265,7 +268,7 @@ describe("CodexEventProcessor: turn spans", () => {
 
 describe("CodexEventProcessor: span timing (from transcript timestamps)", () => {
   // :10Z=1767225610, :11=...611, :12=...612, :13=...613, :14=...614, :15=...615.
-  test("llm and tool spans use their own transcript record timestamps", async () => {
+  test("an llm span starts at its turn's start (first child), not its output record", async () => {
     await assertProducesTrace(
       [
         sessionStart(),
@@ -279,8 +282,11 @@ describe("CodexEventProcessor: span timing (from transcript timestamps)", () => 
           timestamp: "2026-01-01T00:00:11Z",
           payload: { type: "task_started", turn_id: "t1" },
         }),
-        // LLM call: opens at the assistant message (:12), requests a tool (:13),
-        // result arrives (:14), and the call closes at token_count (:15).
+        // LLM call: the assistant message lands at (:12) — but the model's work
+        // for this call began at the turn's start (:11), since this is the first
+        // child. It requests a tool (:13) — that's its last output, so the llm
+        // span ends there. The tool result arrives (:14) and the token_count
+        // (:15) supplies metrics only (it does NOT define the llm span's end).
         transcript({
           type: "response_item",
           timestamp: "2026-01-01T00:00:12Z",
@@ -328,16 +334,263 @@ describe("CodexEventProcessor: span timing (from transcript timestamps)", () => 
             ended: true,
             children: [
               {
-                // LLM call: opened at the message (:12), closed at token_count (:15).
+                // LLM call: starts at the turn's start (:11, first child), not
+                // the message record (:12); ENDS when it emits the tool call (:13),
+                // its last output — NOT at token_count (:15). This is the fix for
+                // the llm span swallowing the tool's execution.
                 span_attributes: { name: "llm", type: "llm" },
-                metrics: { start: 1767225612, end: 1767225615 },
+                metrics: { start: 1767225611, end: 1767225613 },
                 ended: true,
               },
               {
                 // Tool span uses its own record timestamps: function_call (:13)
-                // to function_call_output (:14). Ordered after the llm by start.
+                // to function_call_output (:14). Contiguous with the llm (no
+                // overlap): llm ends at :13, tool starts at :13.
                 span_attributes: { name: "exec_command", type: "tool" },
                 metrics: { start: 1767225613, end: 1767225614 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // When an llm call is the only child of its turn, its span should span almost
+  // the whole turn (start at turn start, end at token_count just before
+  // task_complete) — not appear near-instant.
+  test("a lone llm span fills its turn", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        transcript({
+          type: "session_meta",
+          timestamp: "2026-01-01T00:00:10Z",
+          payload: { cwd: "/work", id: "session-1" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:11Z",
+          payload: { type: "task_started", turn_id: "t1" },
+        }),
+        // The model "thinks" for several seconds; its output only lands at :15.
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:15Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "answer" }],
+          },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:15Z",
+          payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 } } },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:16Z",
+          payload: { type: "task_complete", turn_id: "t1", last_agent_message: "answer" },
+        }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            metrics: { start: 1767225611, end: 1767225616 },
+            children: [
+              {
+                // Starts at turn start (:11), not the output record (:15).
+                span_attributes: { name: "llm", type: "llm" },
+                metrics: { start: 1767225611, end: 1767225615 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // Regression for the "front-of-turn gap" bug: a model call whose ONLY output is
+  // a tool call (no assistant message or readable reasoning before it) must still
+  // open an llm span, so the model's work (often many seconds of thinking before
+  // it emits the tool call) is covered rather than leaving an unaccounted gap
+  // between the turn start and the first child.
+  test("a tool-only model call still opens an llm span filling the front of the turn", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        transcript({
+          type: "session_meta",
+          timestamp: "2026-01-01T00:00:10Z",
+          payload: { cwd: "/work", id: "session-1" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:11Z",
+          payload: { type: "task_started", turn_id: "t1" },
+        }),
+        // The model "thinks" for ~20s, then its first (and only) output for this
+        // call is a tool call at :30 — no preceding message or reasoning.
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:30Z",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            call_id: "c1",
+            metadata: { turn_id: "t1" },
+          },
+        }),
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:32Z",
+          payload: { type: "function_call_output", call_id: "c1", output: "ok" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:32Z",
+          payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 } } },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:33Z",
+          payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" },
+        }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            metrics: { start: 1767225611, end: 1767225633 },
+            children: [
+              {
+                // The llm span covers the model's work from the turn start (:11)
+                // until it emits the tool call (:30, its only output) — filling
+                // the ~20s "thinking" gap. It does NOT extend to the token_count
+                // (:32); that would overlap the tool, which is impossible.
+                span_attributes: { name: "llm", type: "llm" },
+                metrics: { start: 1767225611, end: 1767225630 },
+                ended: true,
+              },
+              {
+                // The tool runs :30 -> :32, contiguous with (not inside) the llm.
+                span_attributes: { name: "exec_command", type: "tool" },
+                metrics: { start: 1767225630, end: 1767225632 },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  // Two model calls separated by a tool: the second call must start where the
+  // tool ended (the model's most recent sibling), so the spans tile the turn
+  // contiguously instead of each looking instant.
+  test("a later llm span starts where the prior sibling (a tool) ended", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        transcript({
+          type: "session_meta",
+          timestamp: "2026-01-01T00:00:10Z",
+          payload: { cwd: "/work", id: "session-1" },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:11Z",
+          payload: { type: "task_started", turn_id: "t1" },
+        }),
+        // Call 1: opens at turn start (:11) on its first output item (an
+        // assistant message at :11), then emits a tool call (:12, its last
+        // output → llm-1 ends there). The token_count (:13) is metrics-only.
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:11Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "let me check" }],
+          },
+        }),
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:12Z",
+          payload: {
+            type: "function_call",
+            name: "exec_command",
+            call_id: "c1",
+            metadata: { turn_id: "t1" },
+          },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:13Z",
+          payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 } } },
+        }),
+        // Tool runs :12 -> :14 (output lands after call 1's token_count).
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:14Z",
+          payload: { type: "function_call_output", call_id: "c1", output: "ok" },
+        }),
+        // Call 2: the model resumes after the tool result. Its output lands at
+        // :18, but it began working when the tool returned (:14).
+        transcript({
+          type: "response_item",
+          timestamp: "2026-01-01T00:00:18Z",
+          payload: {
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text: "done" }],
+          },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:18Z",
+          payload: { type: "token_count", info: { last_token_usage: { total_tokens: 5 } } },
+        }),
+        transcript({
+          type: "event_msg",
+          timestamp: "2026-01-01T00:00:19Z",
+          payload: { type: "task_complete", turn_id: "t1", last_agent_message: "done" },
+        }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            children: [
+              {
+                // Call 1: turn start (:11) -> its last output, the tool call
+                // (:12). Contiguous with the tool; does NOT extend to :13/:14.
+                span_attributes: { name: "llm", type: "llm" },
+                metrics: { start: 1767225611, end: 1767225612 },
+                ended: true,
+              },
+              {
+                // Tool: :12 -> :14.
+                span_attributes: { name: "exec_command", type: "tool" },
+                metrics: { start: 1767225612, end: 1767225614 },
+                ended: true,
+              },
+              {
+                // Call 2: starts at the tool's end (:14), the most recent sibling
+                // end — NOT its own output record (:18). Ends at its last output,
+                // the message (:18). The token_count (:18) is metrics-only.
+                span_attributes: { name: "llm", type: "llm" },
+                metrics: { start: 1767225614, end: 1767225618 },
                 ended: true,
               },
             ],
@@ -375,6 +628,9 @@ describe("CodexEventProcessor: tool spans", () => {
             output: "done",
             ended: true,
             children: [
+              // The model call that emitted the tool call (its only output) opens
+              // an llm span, so the model's work isn't an unaccounted gap.
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "exec_command", type: "tool" },
                 input: '{"cmd":"ls"}',
@@ -414,6 +670,7 @@ describe("CodexEventProcessor: tool spans", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "apply_patch", type: "tool" },
                 input: "*** Begin Patch",
@@ -448,6 +705,9 @@ describe("CodexEventProcessor: tool spans", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              // Both tool calls come from one model call, so a single llm span
+              // opens (on the first tool call) and closes at turn end.
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               { span_attributes: { name: "exec_command", type: "tool" }, output: "a", ended: true },
               { span_attributes: { name: "apply_patch", type: "tool" }, output: "b", ended: true },
             ],
@@ -476,6 +736,7 @@ describe("CodexEventProcessor: tool spans", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "exec_command", type: "tool" },
                 input: "{}",
@@ -542,6 +803,7 @@ describe("CodexEventProcessor: permissions", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "exec_command", type: "tool" },
                 metadata: {
@@ -599,6 +861,8 @@ describe("CodexEventProcessor: permissions", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              // Both attempts come from one model call, so a single llm span opens.
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 // The failed sandboxed attempt: no permission annotation.
                 span_attributes: { name: "exec_command", type: "tool" },
@@ -651,6 +915,7 @@ describe("CodexEventProcessor: permissions", () => {
             span_attributes: { name: "turn: t1", type: "task" },
             ended: true,
             children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
               {
                 span_attributes: { name: "exec_command", type: "tool" },
                 metadata: { permission: undefined },
@@ -1648,6 +1913,159 @@ describe("CodexEventProcessor: subagents", () => {
       expect(subTurn?.metrics?.end).toBeDefined();
       expect(subRoot?.children.some((c) => c.name === "turn: sub-2")).toBe(false);
       expect(subRoot?.children.filter((c) => c.name?.startsWith("turn:")).length).toBe(1);
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // LLM-span start timing is derived per-turn, per-scope, so a subagent's calls
+  // must never influence the main session's call timing (or vice versa) even
+  // though both run concurrently. Each scope tracks its own turn start /
+  // last-child-end, keyed by its own transcript file.
+  test("llm span start timing is isolated per scope across concurrent subagents", async () => {
+    const reader = new MultiFileTranscriptReader();
+    const w = (path: string, record: Record<string, unknown>) =>
+      reader.append(path, JSON.stringify(record));
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "s",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+      await processor.process(configEvent({ session_id: "s" }));
+
+      // Main turn starts at :10 and spawns a subagent; its own model call's output
+      // lands much later (:30), but the call began at the turn start (:10).
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:09Z",
+        type: "session_meta",
+        payload: { id: "s", cwd: "/work/app" },
+      });
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:10Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "main-1" },
+      });
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:10Z",
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "spawn_agent",
+          call_id: "call_spawn",
+          arguments: "{}",
+          metadata: { turn_id: "main-1" },
+        },
+      });
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:11Z",
+        type: "response_item",
+        payload: { type: "function_call_output", call_id: "call_spawn", output: "{}" },
+      });
+      await processor.process(sessionStart({ session_id: "s", transcript_path: MAIN }));
+      await processor.process(
+        postToolUse({
+          session_id: "s",
+          transcript_path: MAIN,
+          tool_name: "spawn_agent",
+          tool_use_id: "call_spawn",
+          tool_response: JSON.stringify({ agent_id: "agent-1" }),
+        }),
+      );
+
+      // Subagent turn starts at :20 (its own clock); its model output lands at
+      // :25 and closes at :25. Its llm span must start at the SUBAGENT turn start
+      // (:20), not be affected by the main scope's :10/:11 boundaries.
+      w(SUB, {
+        timestamp: "2026-01-01T00:00:20Z",
+        type: "session_meta",
+        payload: { id: "agent-1" },
+      });
+      w(SUB, {
+        timestamp: "2026-01-01T00:00:20Z",
+        type: "event_msg",
+        payload: { type: "task_started", turn_id: "sub-1" },
+      });
+      w(SUB, {
+        timestamp: "2026-01-01T00:00:25Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "sub" }],
+        },
+      });
+      w(SUB, {
+        timestamp: "2026-01-01T00:00:25Z",
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: { total_tokens: 1 } } },
+      });
+      w(SUB, {
+        timestamp: "2026-01-01T00:00:26Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "sub-1", last_agent_message: "sub done" },
+      });
+      await processor.process(
+        subagentStart({
+          session_id: "s",
+          transcript_path: SUB,
+          agent_id: "agent-1",
+          agent_type: "default",
+        }),
+      );
+      await processor.process(
+        subagentStop({
+          session_id: "s",
+          transcript_path: MAIN,
+          agent_transcript_path: SUB,
+          agent_id: "agent-1",
+        }),
+      );
+
+      // Main session's own model call: output lands at :30, closes at :30. Its
+      // llm span must start at the MAIN turn start (:10) — the most recent child
+      // of main-1 is the spawn_agent tool (ended :11), so it starts there.
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:30Z",
+        type: "response_item",
+        payload: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "main" }],
+        },
+      });
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:30Z",
+        type: "event_msg",
+        payload: { type: "token_count", info: { last_token_usage: { total_tokens: 1 } } },
+      });
+      w(MAIN, {
+        timestamp: "2026-01-01T00:00:31Z",
+        type: "event_msg",
+        payload: { type: "task_complete", turn_id: "main-1", last_agent_message: "all done" },
+      });
+      await processor.process(stop({ session_id: "s", transcript_path: MAIN, turn_id: "main-1" }));
+      await processor.flush();
+
+      const tree = spansToTree(await trace.drain());
+      const mainTurn = tree?.children.find((c) => c.name === "turn: main-1");
+      // Main llm: opens on the spawn_agent tool call (the model's first output,
+      // before any message), so it starts at the main turn's start (:10 =
+      // 1767225610) and runs until its token_count (:30). The single llm call
+      // spans the spawn tool and the later message.
+      const mainLlm = mainTurn?.children.find((c) => c.name === "llm");
+      expect(mainLlm?.metrics?.start).toBe(1767225610);
+      expect(mainLlm?.metrics?.end).toBe(1767225630);
+
+      // Subagent llm: starts at the SUBAGENT turn start (:20 = 1767225620), wholly
+      // independent of the main scope's boundaries; ends at its token_count (:25).
+      const subRoot = mainTurn?.children.find((c) => c.name === "subagent: agent-1");
+      const subTurn = subRoot?.children.find((c) => c.name === "turn: sub-1");
+      const subLlm = subTurn?.children.find((c) => c.name === "llm");
+      expect(subLlm?.metrics?.start).toBe(1767225620);
+      expect(subLlm?.metrics?.end).toBe(1767225625);
     } finally {
       trace.cleanup();
     }
