@@ -42,11 +42,11 @@ export interface HookClientOptions {
    * Whether to block on a terminal event until the server confirms all events
    * are processed and spans are delivered. Defaults to false. When false the
    * client does nothing on a terminal event — the long-lived server flushes on
-   * its own when the queue goes idle. Set true (via BRAINTRUST_PLUGIN_BLOCK_ON_STOP)
+   * its own when the queue goes idle. Set true (via BRAINTRUST_FLUSH_ON_TURN_END)
    * to guarantee delivery before Codex exits, e.g. in programmatic/CI runs where
    * the process tree is torn down before the idle flush can fire.
    */
-  blockOnStop?: boolean;
+  flushOnTurnEnd?: boolean;
 }
 
 export async function runHookClient(
@@ -87,14 +87,14 @@ export async function runHookClient(
     }
   }
 
-  // On a terminal event, only flush when blockOnStop is set: block until the
+  // On a terminal event, only flush when flushOnTurnEnd is set: block until the
   // server confirms the queue has drained and buffered spans are delivered —
   // important for a CI job (or any short-lived host) that ends right after the
   // agent's last turn, before the background server's idle timeout fires, which
   // would otherwise lose the final spans. Otherwise do nothing: the long-lived
   // server flushes on its own when the queue goes idle, so the turn isn't
   // stalled by a flush request.
-  if (sawTerminal && (options.blockOnStop ?? false)) {
+  if (sawTerminal && (options.flushOnTurnEnd ?? false)) {
     const flushed = await postFlush(config, logger);
     logger.debug("flush requested on terminal event", { flushed });
   }

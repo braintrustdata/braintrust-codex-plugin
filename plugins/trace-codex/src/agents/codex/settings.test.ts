@@ -70,14 +70,14 @@ describe("loadSettingsFile", () => {
     expect(loadSettingsFile(path)).toEqual({});
   });
 
-  test("parses blockOnStop boolean; ignores non-boolean", () => {
-    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: true })))).toEqual({
-      blockOnStop: true,
+  test("parses flushOnTurnEnd boolean; ignores non-boolean", () => {
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: true })))).toEqual({
+      flushOnTurnEnd: true,
     });
-    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: false })))).toEqual({
-      blockOnStop: false,
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: false })))).toEqual({
+      flushOnTurnEnd: false,
     });
-    expect(loadSettingsFile(write(JSON.stringify({ blockOnStop: "yes" })))).toEqual({});
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: "yes" })))).toEqual({});
   });
 
   test("missing file returns {}", () => {
@@ -136,11 +136,11 @@ describe("applySettingsToEnv", () => {
     expect(env.BRAINTRUST_ADDITIONAL_METADATA).toBe('{"team":"platform"}');
   });
 
-  test("maps blockOnStop to BRAINTRUST_PLUGIN_BLOCK_ON_STOP", () => {
+  test("maps flushOnTurnEnd to BRAINTRUST_FLUSH_ON_TURN_END", () => {
     const env: NodeJS.ProcessEnv = {};
-    const applied = applySettingsToEnv({ blockOnStop: true }, env);
-    expect(env.BRAINTRUST_PLUGIN_BLOCK_ON_STOP).toBe("true");
-    expect(applied).toEqual(["blockOnStop"]);
+    const applied = applySettingsToEnv({ flushOnTurnEnd: true }, env);
+    expect(env.BRAINTRUST_FLUSH_ON_TURN_END).toBe("true");
+    expect(applied).toEqual(["flushOnTurnEnd"]);
   });
 });
 

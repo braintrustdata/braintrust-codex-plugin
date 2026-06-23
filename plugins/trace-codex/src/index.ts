@@ -71,8 +71,8 @@ async function main(): Promise<void> {
   try {
     await runHookClient(config, logger, agent.buildEvents, {
       terminalEvents: agent.terminalEvents,
-      // Settings (above) have mapped BRAINTRUST_PLUGIN_BLOCK_ON_STOP into env.
-      blockOnStop: parseBoolEnv(process.env.BRAINTRUST_PLUGIN_BLOCK_ON_STOP),
+      // Settings (above) have mapped BRAINTRUST_FLUSH_ON_TURN_END into env.
+      flushOnTurnEnd: parseBoolEnv(process.env.BRAINTRUST_FLUSH_ON_TURN_END),
     });
   } catch (err) {
     logger.error("unexpected hook client error", { error: String(err) });

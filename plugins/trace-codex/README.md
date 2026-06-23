@@ -12,6 +12,50 @@ codex plugin add trace-codex@braintrust-codex-plugins
 TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
 ```
 
+## Using the plugin in CI
+
+Tracing `codex exec` runs in CI works. A few notes:
+
+- **Block on flush.** Set `BRAINTRUST_FLUSH_ON_TURN_END=true` so the final spans are delivered before the job exits (a short-lived CI job can otherwise tear down before the background server's idle-drain flush fires).
+- **Trust the hooks non-interactively.** Pass `codex exec --dangerously-bypass-hook-trust` to skip the one-time interactive hook-trust prompt. (Only for plugins you trust.)
+
+GitHub Actions example:
+
+```yaml
+name: codex-traced
+on: [workflow_dispatch]
+
+jobs:
+  run:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex   # or your preferred install method
+
+      - name: Install the trace-codex plugin (pinned to a release tag)
+        # TODO: replace with desired version ---------------------------------vvvvvvvvvvvvvvvvvv
+        run: |
+          codex plugin marketplace add braintrustdata/braintrust-codex-plugin@trace-codex-v0.0.X
+          codex plugin add trace-codex@braintrust-codex-plugins
+
+      - name: Run a traced Codex session
+        env:
+          TRACE_TO_BRAINTRUST: "true"
+          BRAINTRUST_API_KEY: ${{ secrets.BRAINTRUST_API_KEY }}
+          BRAINTRUST_PROJECT: my-coding-agent # <--- TODO: replace with your project name
+          BRAINTRUST_FLUSH_ON_TURN_END: "true"
+        run: |
+          codex exec \
+            --skip-git-repo-check \
+            --dangerously-bypass-hook-trust \
+            --sandbox read-only \
+            "summarize the changes in this repo"
+```
+
+If your plugin release repo is private, also expose a token the launcher can use to download the binary (`GH_TOKEN` or `GITHUB_TOKEN`, or an authenticated `gh`).
+
 ## Configuration
 
 There are two ways to configure the plugin. **Environment variables always win over the config file**
@@ -30,7 +74,7 @@ Every setting can be provided as a `config.json` key or as an environment variab
 | `project`            | `BRAINTRUST_PROJECT`                  | _(unset)_          | Project to log traces into.                                                                                                                  |
 | `apiUrl`             | `BRAINTRUST_API_URL`                  | api.braintrust.dev | Braintrust API URL.                                                                                                                          |
 | `additionalMetadata` | `BRAINTRUST_ADDITIONAL_METADATA`      | _(unset)_          | JSON object of extra metadata merged into the root span. Standard keys (`session_id`, `model`, `project`, etc.) take precedence on conflict. |
-| `blockOnStop`        | `BRAINTRUST_PLUGIN_BLOCK_ON_STOP`     | `false`            | When `true`, the hook blocks on each turn's `Stop` until the server confirms all spans are flushed. Use in programmatic/CI runs to guarantee traces are delivered before Codex exits. |
+| `flushOnTurnEnd`     | `BRAINTRUST_FLUSH_ON_TURN_END`        | `false`            | When `true`, the hook blocks at each turn's end (the `Stop` event) until the server confirms all spans are flushed. Use in programmatic/CI runs to guarantee traces are delivered before Codex exits. |
 | `recordFile`         | `BRAINTRUST_EVENT_SERVER_RECORD_FILE` | _(unset)_          | If set, record every event to this NDJSON file (for `replay`).                                                                               |
 
 ### Resuming sessions
@@ -59,17 +103,3 @@ Advanced plugin settings for debugging or developing the plugin
 | _(none)_              | `BRAINTRUST_EVENT_SERVER_LOG_DIR`                | `$PLUGIN_DATA` | Directory for logs, pidfile, and `config.json`. |
 
 The config file is read by the hook client only at the moment it boots the background server (the running server keeps the config it started with). To pick up config changes, stop the server (or wait for it to idle out) so the next event re-boots it.
-
-## Smoke test
-
-`make smoke` runs a full end-to-end check: it starts a local mock Braintrust collector, runs a real `codex exec "say hi"` session with tracing pointed at the mock, and asserts at least one trace row was reported. This exercises the whole path (Codex hook -> background server -> Braintrust SDK flush) without touching a real Braintrust account.
-
-Requirements: `codex` and `bun` on `PATH`, `OPENAI_API_KEY` set, and the plugin installed in Codex (run `../../install.sh trace-codex` for a local dev install).
-
-```bash
-OPENAI_API_KEY=sk-... make smoke
-# Pin the release whose codex-hook binary the launcher downloads:
-OPENAI_API_KEY=sk-... make smoke SMOKE_VERSION=0.0.1
-```
-
-CI runs the same smoke test (macOS arm64/x64 and Linux) after every release via `.github/workflows/smoke.yaml`. That workflow can also be dispatched manually from the Actions tab against any published release version.

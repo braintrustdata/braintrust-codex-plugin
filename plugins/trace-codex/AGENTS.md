@@ -99,7 +99,7 @@ The terminal event is the one place where blocking is even an option, and it's
 **opt-in**:
 
 - On a **terminal event** (`Stop`), the client calls `/flush` **only** when
-  `BRAINTRUST_PLUGIN_BLOCK_ON_STOP` is set, blocking until the server confirms the
+  `BRAINTRUST_FLUSH_ON_TURN_END` is set, blocking until the server confirms the
   queue has drained and buffered spans reached Braintrust. The blocking mode
   exists for short-lived hosts (e.g. a CI job that ends right after the last turn)
   that would otherwise tear the process tree down before the final spans are

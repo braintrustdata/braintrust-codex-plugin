@@ -20,7 +20,7 @@ export interface Agent {
   /**
    * Event names that terminate a turn/session. After enqueuing one of these,
    * the hook asks the server to flush. By default the flush is fire-and-forget
-   * so the turn isn't stalled; setting BRAINTRUST_PLUGIN_BLOCK_ON_STOP makes the
+   * so the turn isn't stalled; setting BRAINTRUST_FLUSH_ON_TURN_END makes the
    * hook block until the server confirms the final spans are delivered before
    * the process tree is torn down (e.g. in CI). Codex only exposes a per-turn
    * "Stop" hook today; there is no session-end event.

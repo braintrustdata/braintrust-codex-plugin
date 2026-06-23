@@ -26,12 +26,12 @@ export interface Settings {
   /** Master switch: when false or unset, no traces are reported to Braintrust. */
   traceToBraintrust?: boolean;
   /**
-   * When true, the hook blocks on the Stop event until the server confirms all
-   * events are processed and spans are flushed. Useful in programmatic/CI runs
-   * to guarantee traces are delivered before Codex exits. Defaults to false
-   * (fire-and-forget flush so the turn isn't stalled).
+   * When true, the hook blocks at each turn's end (the Stop event) until the
+   * server confirms all events are processed and spans are flushed. Useful in
+   * programmatic/CI runs to guarantee traces are delivered before Codex exits.
+   * Defaults to false (fire-and-forget flush so the turn isn't stalled).
    */
-  blockOnStop?: boolean;
+  flushOnTurnEnd?: boolean;
   /** Extra metadata merged into the root span (standard keys win on conflict). */
   additionalMetadata?: Record<string, unknown>;
   /** If set, record every event to this NDJSON file (for replay). */
@@ -51,7 +51,7 @@ export const SETTINGS_TO_ENV: Record<keyof Settings, string> = {
   appUrl: "BRAINTRUST_APP_URL",
   project: "BRAINTRUST_PROJECT",
   traceToBraintrust: "TRACE_TO_BRAINTRUST",
-  blockOnStop: "BRAINTRUST_PLUGIN_BLOCK_ON_STOP",
+  flushOnTurnEnd: "BRAINTRUST_FLUSH_ON_TURN_END",
   additionalMetadata: "BRAINTRUST_ADDITIONAL_METADATA",
   recordFile: "BRAINTRUST_EVENT_SERVER_RECORD_FILE",
   port: "BRAINTRUST_EVENT_SERVER_PORT",
@@ -63,7 +63,7 @@ const SETTING_KEYS = Object.keys(SETTINGS_TO_ENV) as Array<keyof Settings>;
 
 const NUMBER_KEYS = new Set<keyof Settings>(["port", "idleTimeoutMs", "idleCheckIntervalMs"]);
 
-const BOOLEAN_KEYS = new Set<keyof Settings>(["traceToBraintrust", "blockOnStop"]);
+const BOOLEAN_KEYS = new Set<keyof Settings>(["traceToBraintrust", "flushOnTurnEnd"]);
 
 /**
  * The plugin's writable data directory, where config.json lives. Resolved

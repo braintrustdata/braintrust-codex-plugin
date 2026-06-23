@@ -124,7 +124,7 @@ export BRAINTRUST_EVENT_SERVER_IDLE_CHECK_INTERVAL_MS=1000
 # `codex exec` returns. Without this the hook just enqueues and relies on the
 # server's idle-drain flush, which may not fire before this short-lived run tears
 # the process tree down — making the assertion below flaky.
-export BRAINTRUST_PLUGIN_BLOCK_ON_STOP=true
+export BRAINTRUST_FLUSH_ON_TURN_END=true
 
 # Pin the release the launcher downloads, when requested. The launcher strips an
 # optional leading 'v', so either form is fine here.
@@ -153,7 +153,7 @@ if [ "$codex_status" -ne 0 ]; then
   scrub <"$CODEX_LOG" >&2 || true
 fi
 
-# With BRAINTRUST_PLUGIN_BLOCK_ON_STOP=true (set above), the hook client blocks
+# With BRAINTRUST_FLUSH_ON_TURN_END=true (set above), the hook client blocks
 # on a synchronous flush at session end, so by the time codex exec returns the
 # trace should already be delivered. Stop the collector (via cleanup) to make it
 # write its summary, then assert.
