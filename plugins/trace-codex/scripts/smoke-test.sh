@@ -120,6 +120,11 @@ export BRAINTRUST_PROJECT=trace-codex-smoke
 # Keep the background event server short-lived so it doesn't linger after CI.
 export BRAINTRUST_EVENT_SERVER_IDLE_TIMEOUT_MS=15000
 export BRAINTRUST_EVENT_SERVER_IDLE_CHECK_INTERVAL_MS=1000
+# Block on the terminal-event flush so the final spans are delivered before
+# `codex exec` returns. Without this the hook just enqueues and relies on the
+# server's idle-drain flush, which may not fire before this short-lived run tears
+# the process tree down — making the assertion below flaky.
+export BRAINTRUST_PLUGIN_BLOCK_ON_STOP=true
 
 # Pin the release the launcher downloads, when requested. The launcher strips an
 # optional leading 'v', so either form is fine here.
@@ -148,9 +153,10 @@ if [ "$codex_status" -ne 0 ]; then
   scrub <"$CODEX_LOG" >&2 || true
 fi
 
-# The hook client blocks on a synchronous flush at session end, so by the time
-# codex exec returns the trace should already be delivered. Stop the collector
-# (via cleanup) to make it write its summary, then assert.
+# With BRAINTRUST_PLUGIN_BLOCK_ON_STOP=true (set above), the hook client blocks
+# on a synchronous flush at session end, so by the time codex exec returns the
+# trace should already be delivered. Stop the collector (via cleanup) to make it
+# write its summary, then assert.
 cleanup
 COLLECTOR_PID=""  # already stopped; avoid double-kill in the EXIT trap
 

@@ -98,15 +98,15 @@ critical path.
 The terminal event is the one place where blocking is even an option, and it's
 **opt-in**:
 
-- On a **terminal event** (`Stop`), the client always calls `/flush`, but by
-  default it fires the flush and returns immediately so the turn isn't stalled.
-  Setting `BRAINTRUST_PLUGIN_BLOCK_ON_STOP` makes the client instead wait for the
-  server to confirm buffered spans reached Braintrust. The blocking mode exists
-  for short-lived hosts (e.g. a CI job that ends right after the last turn) that
-  would otherwise tear the process tree down before the final spans are
+- On a **terminal event** (`Stop`), the client calls `/flush` **only** when
+  `BRAINTRUST_PLUGIN_BLOCK_ON_STOP` is set, blocking until the server confirms the
+  queue has drained and buffered spans reached Braintrust. The blocking mode
+  exists for short-lived hosts (e.g. a CI job that ends right after the last turn)
+  that would otherwise tear the process tree down before the final spans are
   delivered. When enabled, the wait is bounded by a timeout (`/flush` gives up
-  rather than hanging the turn). In normal interactive use the server stays alive
-  and flushes off the critical path, so no spans are lost without blocking.
+  rather than hanging the turn). By default the client does nothing on `Stop`: the
+  long-lived server flushes on its own when the queue goes idle, so in normal
+  interactive use no spans are lost and the turn isn't stalled by a flush request.
 
 When adding behavior, prefer enqueue-and-return. Reach for a blocking
 request/await only when data would otherwise be lost, keep it off the
