@@ -13,6 +13,10 @@
 #                      installed plugin, traced to a local mock collector, and
 #                      assert >=1 trace row. Requires codex, bun, and
 #                      OPENAI_API_KEY; optionally SMOKE_VERSION to pin a release.
+#   make token-proxy   Run the token-counting proxy (debugging aid) that sits
+#                      between Codex and OpenAI and prints each call's token usage
+#                      for comparison against the trace. Requires OPENAI_API_KEY.
+#                      See scripts/token-proxy.ts for the config.toml snippet.
 #   make clean         Remove build artifacts.
 
 SHELL := /bin/bash
@@ -28,7 +32,7 @@ EXPECTED_VERSION := $(shell sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"
 BIN := bin/codex-hook
 BASE_URL := http://127.0.0.1:$(TEST_PORT)
 
-.PHONY: test lint typecheck unit build integration smoke clean
+.PHONY: test lint typecheck unit build integration smoke token-proxy clean
 
 test: lint typecheck unit integration
 
@@ -92,6 +96,12 @@ integration: build
 smoke:
 	@echo "==> Smoke test"
 	SMOKE_RELEASE_VERSION="$(SMOKE_VERSION)" sh scripts/smoke-test.sh
+
+# Token-counting proxy for verifying trace-codex's token accounting. Run it, then
+# point Codex at it via a custom model_provider (see scripts/token-proxy.ts).
+token-proxy:
+	@echo "==> Token proxy (Ctrl-C for the session total)"
+	bun run scripts/token-proxy.ts
 
 clean:
 	@echo "==> Cleaning"
