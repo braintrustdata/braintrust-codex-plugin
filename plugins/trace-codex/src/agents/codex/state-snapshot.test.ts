@@ -15,13 +15,11 @@ function snapshot(overrides: Partial<CodexSnapshot> = {}): CodexSnapshot {
     reportingConfig: undefined,
     rootSpan: null,
     rootEnded: false,
+    rootEndTime: undefined,
     rootEnrichment: {},
     mainScopePath: null,
     scopes: [],
-    spawnTurnSpansByCallId: [],
-    spawnTurnSpansByAgentId: [],
     compactionTriggerByTurn: [],
-    compactionSpansByTurn: [],
     ...overrides,
   };
 }

@@ -30,7 +30,7 @@ import type { ReportingConfig, SpanRef } from "../../braintrust/logger.ts";
  * fresh, losing only resume continuity), so we never try to rehydrate state we
  * can't interpret.
  */
-export const SNAPSHOT_SCHEMA_VERSION = 3;
+export const SNAPSHOT_SCHEMA_VERSION = 4;
 
 /** A conversation item (chat message or reasoning), stored verbatim. These are
  * plain JSON already, so they round-trip without transformation. */
@@ -90,12 +90,6 @@ export interface ScopeSnapshot {
   pendingSubagent?: PendingSubagentSnapshot;
 }
 
-/** A side-map entry pairing a key (turn_id or call_id or agent_id) with a span. */
-export interface SpanMapEntry {
-  key: string;
-  span: SpanRef;
-}
-
 /** A side-map entry pairing a key with a string value. */
 export interface StringMapEntry {
   key: string;
@@ -122,16 +116,23 @@ export interface CodexSnapshot {
 
   rootSpan: SpanRef | null;
   rootEnded: boolean;
+  /** When the root was ended (Unix seconds), if it has been; re-asserted on
+   * resume so the rehydrated root row stays closed. */
+  rootEndTime: number | undefined;
   rootEnrichment: { source?: string; permissionMode?: string };
 
   /** Path of the main scope within `scopes`, if it exists. */
   mainScopePath: string | null;
   scopes: ScopeSnapshot[];
 
-  spawnTurnSpansByCallId: SpanMapEntry[];
-  spawnTurnSpansByAgentId: SpanMapEntry[];
+  /**
+   * Compaction triggers ("manual"/"auto") keyed by turn_id. Plain strings (no
+   * span references), so safe to carry across a restart. The span-bearing
+   * side-maps (spawn-agent turn spans, compaction spans) are deliberately NOT
+   * persisted: they hold references to spans that may have closed, and
+   * rehydrating a closed span re-opens it.
+   */
   compactionTriggerByTurn: StringMapEntry[];
-  compactionSpansByTurn: SpanMapEntry[];
 }
 
 /** A parsed snapshot is usable only if it matches our plugin + schema version. */

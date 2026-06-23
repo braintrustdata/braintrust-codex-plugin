@@ -21,6 +21,7 @@ import { CodexEventProcessor } from "./event-processor.ts";
 import { SnapshotStore } from "./snapshot-store.ts";
 import type { CodexSnapshot } from "./state-snapshot.ts";
 import {
+  compacted,
   configEvent,
   FakeTranscriptReader,
   functionCall,
@@ -32,6 +33,7 @@ import {
   type TraceEntry,
   taskComplete,
   taskStarted,
+  tokenCount,
   transcript,
   turnContext,
   userMessage,
@@ -426,13 +428,11 @@ describe("CodexEventProcessor: resume from snapshot", () => {
         reportingConfig: { traceToBraintrust: true },
         rootSpan: { spanId: "stale", rootSpanId: "stale", spanParents: [] },
         rootEnded: false,
+        rootEndTime: undefined,
         rootEnrichment: {},
         mainScopePath: "/old.jsonl",
         scopes: [],
-        spawnTurnSpansByCallId: [],
-        spawnTurnSpansByAgentId: [],
         compactionTriggerByTurn: [],
-        compactionSpansByTurn: [],
       });
 
       const deps = { queueId, reader, factory: trace.spanFactory, store };
@@ -457,6 +457,213 @@ describe("CodexEventProcessor: resume from snapshot", () => {
         span_attributes: { name: "codex: fresh", type: "task" },
         children: [{ span_attributes: { name: "turn: turn-1" }, output: "ok", children: [] }],
       });
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // Regression for the duplicate/never-closing compaction span: a compaction that
+  // FINISHED before the restart must not be re-opened on resume. (Previously the
+  // compaction span lived forever in a side-map and was rehydrated — re-emitting
+  // it with a fresh start and no end.)
+  test("a completed compaction is not re-opened on resume", async () => {
+    const trace = withCapturedTrace();
+    try {
+      const queueId = "sess-compact";
+      const reader = new FakeTranscriptReader();
+      const store = new MemorySnapshotStore();
+      const deps = { queueId, reader, factory: trace.spanFactory, store };
+
+      // Run 1: a turn, then a compaction turn that completes, all before shutdown.
+      await runThrough(
+        [
+          configEvent({ session_id: queueId }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "session_meta",
+            payload: { id: queueId, cwd: "/tmp/proj" },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "turn_context",
+            payload: { model: "gpt-5.5" },
+          }),
+          // A normal turn.
+          transcript({
+            timestamp: "2026-01-01T00:00:11Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-1" },
+          }),
+          userMessage({ message: "hi" }),
+          taskComplete({ turn_id: "turn-1", last_agent_message: "hello" }),
+          stop({ turn_id: "turn-1" }),
+          // A compaction turn that fully completes.
+          transcript({
+            timestamp: "2026-01-01T00:00:20Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-2" },
+          }),
+          compacted({
+            replacement_history: [{ type: "message", role: "user", content: [] }],
+            window_id: 1,
+          }),
+          tokenCount({ total_tokens: 5 }),
+          transcript({
+            timestamp: "2026-01-01T00:00:22Z",
+            type: "event_msg",
+            payload: { type: "task_complete", turn_id: "turn-2", last_agent_message: "" },
+          }),
+          // A non-terminal hook drives the catch-up that consumes the above.
+          preToolUse({ session_id: queueId }),
+        ],
+        deps,
+      );
+
+      // The compaction span finished in run 1.
+      let spans = await trace.drain();
+      const compaction1 = spans.find((s) => s.span_attributes?.name === "compaction");
+      expect(compaction1?.metrics?.end).toBeDefined();
+      const compactionId = compaction1?.span_id;
+
+      // Run 2: a new processor resumes and runs another turn.
+      await runThrough(
+        [
+          transcript({
+            timestamp: "2026-01-01T00:00:30Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-3" },
+          }),
+          userMessage({ message: "again" }),
+          taskComplete({ turn_id: "turn-3", last_agent_message: "ok" }),
+          stop({ turn_id: "turn-3" }),
+        ],
+        deps,
+      );
+
+      spans = await trace.drain();
+      // The compaction span must NOT have been re-emitted (reopened) on resume:
+      // run 2 produces no row for its span_id.
+      expect(spans.some((s) => s.span_id === compactionId)).toBe(false);
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // The root span, ended before a restart, must keep its original start AND end
+  // after resume — rehydrating it re-emits its row, so we re-assert the end.
+  test("a root ended before a restart keeps its original start and end", async () => {
+    const trace = withCapturedTrace();
+    try {
+      const queueId = "sess-rootend";
+      const reader = new FakeTranscriptReader();
+      const store = new MemorySnapshotStore();
+      const deps = { queueId, reader, factory: trace.spanFactory, store };
+
+      // Run 1: a full turn; its Stop ends the root at the turn's end (:13).
+      await runThrough(
+        [
+          configEvent({ session_id: queueId }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "session_meta",
+            payload: { id: queueId, cwd: "/tmp/proj" },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:11Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-1" },
+          }),
+          userMessage({ message: "hi" }),
+          transcript({
+            timestamp: "2026-01-01T00:00:13Z",
+            type: "event_msg",
+            payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: "hello" },
+          }),
+          stop({ turn_id: "turn-1" }),
+        ],
+        deps,
+      );
+
+      const snap = store.read(queueId);
+      expect(snap?.rootEnded).toBe(true);
+      expect(snap?.rootEndTime).toBe(1767225613);
+
+      // Run 2: a new processor resumes (a second turn arrives).
+      await runThrough(
+        [
+          transcript({
+            timestamp: "2026-01-01T00:00:20Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-2" },
+          }),
+          userMessage({ message: "again" }),
+          taskComplete({ turn_id: "turn-2", last_agent_message: "ok" }),
+          stop({ turn_id: "turn-2" }),
+        ],
+        deps,
+      );
+
+      const spans = await trace.drain();
+      const tree = spansToTree(spans);
+      // The root kept its original start (:10) and end (:13) — not corrupted to
+      // the resume time, not left open.
+      expect(tree?.metrics?.start).toBe(1767225610);
+      expect(tree?.metrics?.end).toBe(1767225613);
+      // The second turn still attached under the same root.
+      expect(tree?.children.some((c) => c.name === "turn: turn-2")).toBe(true);
+    } finally {
+      trace.cleanup();
+    }
+  });
+
+  // An OPEN span spanning the restart must keep its original start (the SDK would
+  // otherwise stamp the rehydration time). Here the turn opens at :11 in run 1
+  // and is closed in run 2.
+  test("an open turn span keeps its original start across a restart", async () => {
+    const trace = withCapturedTrace();
+    try {
+      const queueId = "sess-openstart";
+      const reader = new FakeTranscriptReader();
+      const store = new MemorySnapshotStore();
+      const deps = { queueId, reader, factory: trace.spanFactory, store };
+
+      await runThrough(
+        [
+          configEvent({ session_id: queueId }),
+          transcript({
+            timestamp: "2026-01-01T00:00:10Z",
+            type: "session_meta",
+            payload: { id: queueId, cwd: "/tmp/proj" },
+          }),
+          transcript({
+            timestamp: "2026-01-01T00:00:11Z",
+            type: "event_msg",
+            payload: { type: "task_started", turn_id: "turn-1" },
+          }),
+          userMessage({ message: "hi" }),
+          sessionStart({ session_id: queueId, source: "startup" }),
+          preToolUse({ session_id: queueId }),
+        ],
+        deps,
+      );
+
+      await runThrough(
+        [
+          transcript({
+            timestamp: "2026-01-01T00:00:30Z",
+            type: "event_msg",
+            payload: { type: "task_complete", turn_id: "turn-1", last_agent_message: "done" },
+          }),
+          stop({ turn_id: "turn-1" }),
+        ],
+        deps,
+      );
+
+      const tree = spansToTree(await trace.drain());
+      const turn = tree?.children.find((c) => c.name === "turn: turn-1");
+      // Start preserved from run 1 (:11), end from run 2 (:30) — not the resume time.
+      expect(turn?.metrics?.start).toBe(1767225611);
+      expect(turn?.metrics?.end).toBe(1767225630);
     } finally {
       trace.cleanup();
     }

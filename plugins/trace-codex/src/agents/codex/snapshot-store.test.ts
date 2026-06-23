@@ -15,13 +15,11 @@ function makeSnapshot(sessionId: string): CodexSnapshot {
     reportingConfig: { project: "p", traceToBraintrust: true },
     rootSpan: { spanId: "r", rootSpanId: "r", spanParents: [] },
     rootEnded: false,
+    rootEndTime: undefined,
     rootEnrichment: { source: "startup" },
     mainScopePath: "/t.jsonl",
     scopes: [],
-    spawnTurnSpansByCallId: [],
-    spawnTurnSpansByAgentId: [],
     compactionTriggerByTurn: [],
-    compactionSpansByTurn: [],
   };
 }
 

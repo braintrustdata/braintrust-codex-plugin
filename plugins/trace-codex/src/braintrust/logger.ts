@@ -31,20 +31,32 @@ export interface SpanRef {
    */
   name?: string;
   type?: StartSpanArgs["type"];
+  /**
+   * The span's original start time (Unix seconds). Re-asserted on rehydration so
+   * the merged row keeps its original start — without it the SDK stamps the start
+   * to the moment of rehydration (the resume time), corrupting the span's timing.
+   */
+  startTime?: number;
 }
 
 /**
- * Capture a live span's identity for later rehydration. `name`/`type` are the
- * attributes the span was created with (the SDK doesn't expose them as getters),
- * passed by the caller so they can be re-asserted on resume.
+ * Capture a live span's identity for later rehydration. `name`/`type`/`startTime`
+ * are the attributes the span was created with (the SDK doesn't expose them as
+ * getters), passed by the caller so they can be re-asserted on resume.
  */
-export function spanRef(span: Span, name?: string, type?: StartSpanArgs["type"]): SpanRef {
+export function spanRef(
+  span: Span,
+  name?: string,
+  type?: StartSpanArgs["type"],
+  startTime?: number,
+): SpanRef {
   return {
     spanId: span.spanId,
     rootSpanId: span.rootSpanId,
     spanParents: span.spanParents,
     ...(name !== undefined ? { name } : {}),
     ...(type !== undefined ? { type } : {}),
+    ...(startTime !== undefined ? { startTime } : {}),
   };
 }
 
@@ -128,6 +140,7 @@ export function createSpanFactory(config?: ReportingConfig, diagLogger?: Logger)
         parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
         ...(ref.name !== undefined ? { name: ref.name } : {}),
         ...(ref.type !== undefined ? { type: ref.type } : {}),
+        ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
       }),
     flush: async () => {
       try {

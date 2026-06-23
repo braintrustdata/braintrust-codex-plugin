@@ -423,6 +423,11 @@ export class CodexEventProcessor implements EventProcessor {
   private reportingConfig: ReportingConfig | undefined;
   private rootSpan: Span | null = null;
   private rootEnded = false;
+  // The time (Unix seconds) the root span was ended, if it has been. Persisted so
+  // that on resume — where rehydrating the root necessarily re-emits its row — we
+  // can re-assert the end time and keep the root closed, rather than leaving it
+  // looking open (a rehydrated handle is created with no end).
+  private rootEndTime: number | undefined;
   // Root enrichment from the SessionStart hook (source/permission_mode), which
   // the transcript lacks. Applied when the root span is created, or patched onto
   // the root if it already exists.
@@ -461,7 +466,10 @@ export class CodexEventProcessor implements EventProcessor {
   // doesn't expose these as getters, but a rehydrated span must re-assert them
   // (else the SDK infers a wrong name from the call stack on resume), so we
   // remember them here and feed them into each SpanRef at serialize time.
-  private readonly spanAttrs = new Map<string, { name: string; type: SpanRef["type"] }>();
+  private readonly spanAttrs = new Map<
+    string,
+    { name: string; type: SpanRef["type"]; startTime: number | undefined }
+  >();
   // Optional per-session state store. When present, the processor persists a
   // snapshot of its resumable state on flush and, on its first event, rehydrates
   // any snapshot left by a previous server run for this session (so a session
@@ -815,6 +823,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         subagentName,
         "task",
+        startTime,
       );
       this.logger.info("codex processor: opened subagent root span", {
         queueId: this.queueId,
@@ -1057,6 +1066,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         spanName,
         "task",
+        startTime,
       );
       this.logger.info("codex processor: opened root span", {
         queueId: this.queueId,
@@ -1126,6 +1136,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         turnName,
         "task",
+        startTime,
       );
       scope.openTurns.set(turnId, { span: turnSpan, startTime, lastChildEndTime: undefined });
       this.logger.info("codex processor: opened turn span", {
@@ -1171,8 +1182,12 @@ export class CodexEventProcessor implements EventProcessor {
     try {
       turnSpan.setAttributes({ name: "compaction", type: "task" });
       // Remember the rename so a resumed snapshot re-asserts "compaction", not
-      // the original "turn: ..." name.
-      this.spanAttrs.set(turnSpan.spanId, { name: "compaction", type: "task" });
+      // the original "turn: ..." name. Preserve the span's original start time.
+      this.spanAttrs.set(turnSpan.spanId, {
+        name: "compaction",
+        type: "task",
+        startTime: this.spanAttrs.get(turnSpan.spanId)?.startTime,
+      });
       turnSpan.log({
         metadata: {
           compaction: {
@@ -1220,6 +1235,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         compactionLlmName,
         "llm",
+        startTime,
       );
       // Reuse the open-llm slot so the turn's token_count closes it with usage.
       // outputPreset: the replacement history is already logged as the output, so
@@ -1374,6 +1390,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         llmName,
         "llm",
+        startTime,
       );
       scope.openLlm = { span, turnId, output: [], lastOutputTime: startTime };
       this.logger.info("codex processor: opened llm span", {
@@ -1598,6 +1615,7 @@ export class CodexEventProcessor implements EventProcessor {
         }),
         toolName,
         "tool",
+        startTime,
       );
       scope.openTools.set(callId, { span: toolSpan, turnId });
       // Remember the TURN span that ran a spawn_agent tool (main scope only) so a
@@ -1771,6 +1789,7 @@ export class CodexEventProcessor implements EventProcessor {
   private endRootSpan(endTime: number | undefined): void {
     if (this.rootSpan === null || this.rootEnded) return;
     this.rootEnded = true;
+    this.rootEndTime = endTime;
     const endArgs = endTime !== undefined ? { endTime } : undefined;
     const scope = this.mainScope;
     // Backstop: close any open LLM span, any still-open tool spans, then any
@@ -1898,15 +1917,22 @@ export class CodexEventProcessor implements EventProcessor {
   // Remember the name/type a span was created (or renamed) with, so it can be
   // re-asserted on rehydration. Returns the span unchanged for call-site
   // convenience.
-  private trackSpan(span: Span, name: string, type: SpanRef["type"]): Span {
-    this.spanAttrs.set(span.spanId, { name, type });
+  private trackSpan(
+    span: Span,
+    name: string,
+    type: SpanRef["type"],
+    startTime: number | undefined,
+  ): Span {
+    this.spanAttrs.set(span.spanId, { name, type, startTime });
     return span;
   }
 
-  // Capture a span's identity plus its remembered name/type for the snapshot.
+  // Capture a span's identity plus its remembered name/type/start for the
+  // snapshot, so a rehydrated handle keeps them (and isn't re-stamped to the
+  // resume time).
   private refFor(span: Span): SpanRef {
     const attrs = this.spanAttrs.get(span.spanId);
-    return spanRef(span, attrs?.name, attrs?.type);
+    return spanRef(span, attrs?.name, attrs?.type, attrs?.startTime);
   }
 
   // Build a serializable snapshot of all resumable state. Span handles are
@@ -1967,24 +1993,22 @@ export class CodexEventProcessor implements EventProcessor {
       reportingConfig: redactReportingConfig(this.reportingConfig),
       rootSpan: this.rootSpan === null ? null : this.refFor(this.rootSpan),
       rootEnded: this.rootEnded,
+      rootEndTime: this.rootEndTime,
       rootEnrichment: { ...this.rootEnrichment },
       mainScopePath: this.mainScope?.path ?? null,
       scopes,
-      spawnTurnSpansByCallId: Array.from(this.spawnTurnSpansByCallId, ([key, span]) => ({
-        key,
-        span: this.refFor(span),
-      })),
-      spawnTurnSpansByAgentId: Array.from(this.spawnTurnSpansByAgentId, ([key, span]) => ({
-        key,
-        span: this.refFor(span),
-      })),
+      // We deliberately do NOT persist the span-bearing side-maps
+      // (spawnTurnSpansBy*, compactionSpansByTurn). They retain references to
+      // spans that have since CLOSED, and rehydrating a closed span re-opens it
+      // (the SDK stamps a fresh start and no end), producing duplicate, never-
+      // closing spans on resume. The only things they enable across a restart are
+      // rare in-flight reconciliations (nesting a subagent spawned right before
+      // the restart; back-filling a compaction trigger whose hook lands after the
+      // restart) — acceptable to lose. The trigger map is plain strings (no span
+      // refs), so it's harmless to keep.
       compactionTriggerByTurn: Array.from(this.compactionTriggerByTurn, ([key, value]) => ({
         key,
         value,
-      })),
-      compactionSpansByTurn: Array.from(this.compactionSpansByTurn, ([key, span]) => ({
-        key,
-        span: this.refFor(span),
       })),
     };
   }
@@ -2010,19 +2034,39 @@ export class CodexEventProcessor implements EventProcessor {
     }
 
     const factory = this.spanFactory;
-    // Rehydrate a handle and re-remember its name/type, so if this resumed
+    // Rehydrate a handle and re-remember its name/type/start, so if this resumed
     // processor is itself snapshotted again, the attributes survive the next hop.
     const rehydrate = (ref: SpanRef): Span => {
       const span = factory.rehydrateSpan(ref);
       if (ref.name !== undefined && ref.type !== undefined) {
-        this.spanAttrs.set(span.spanId, { name: ref.name, type: ref.type });
+        this.spanAttrs.set(span.spanId, {
+          name: ref.name,
+          type: ref.type,
+          startTime: ref.startTime,
+        });
       }
       return span;
     };
 
     this.rootSpan = snapshot.rootSpan === null ? null : rehydrate(snapshot.rootSpan);
     this.rootEnded = snapshot.rootEnded;
+    this.rootEndTime = snapshot.rootEndTime;
     this.rootEnrichment = { ...snapshot.rootEnrichment };
+    // Rehydrating the root necessarily re-emits its row with no end time. If the
+    // root was already ended before the restart, re-assert that end now so it
+    // stays closed (a later turn can still attach as a child of an ended root).
+    if (this.rootEnded && this.rootSpan !== null) {
+      try {
+        this.rootSpan.end(
+          this.rootEndTime !== undefined ? { endTime: this.rootEndTime } : undefined,
+        );
+      } catch (err) {
+        this.logger.error("codex processor: failed to re-end root span on restore", {
+          queueId: this.queueId,
+          error: String(err),
+        });
+      }
+    }
 
     for (const s of snapshot.scopes) {
       const isMain = s.path === snapshot.mainScopePath;
@@ -2077,17 +2121,12 @@ export class CodexEventProcessor implements EventProcessor {
       if (isMain) this.mainScope = scope;
     }
 
-    for (const e of snapshot.spawnTurnSpansByCallId) {
-      this.spawnTurnSpansByCallId.set(e.key, rehydrate(e.span));
-    }
-    for (const e of snapshot.spawnTurnSpansByAgentId) {
-      this.spawnTurnSpansByAgentId.set(e.key, rehydrate(e.span));
-    }
+    // Span-bearing side-maps (spawnTurnSpansBy*, compactionSpansByTurn) are not
+    // persisted — see serialize() — so there is nothing to rehydrate for them,
+    // which is what keeps a resume from re-opening already-closed spans. Only the
+    // plain-string trigger map is restored.
     for (const e of snapshot.compactionTriggerByTurn) {
       this.compactionTriggerByTurn.set(e.key, e.value);
-    }
-    for (const e of snapshot.compactionSpansByTurn) {
-      this.compactionSpansByTurn.set(e.key, rehydrate(e.span));
     }
   }
 

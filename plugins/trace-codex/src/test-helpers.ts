@@ -135,6 +135,7 @@ export function withCapturedTrace(): CapturedTrace {
           parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
           ...(ref.name !== undefined ? { name: ref.name } : {}),
           ...(ref.type !== undefined ? { type: ref.type } : {}),
+          ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
         }),
       flush: () => logger.flush(),
     },
