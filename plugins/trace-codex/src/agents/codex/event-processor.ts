@@ -276,16 +276,52 @@ function tokenMetrics(usage: Record<string, unknown>): Record<string, number> {
   const metrics: Record<string, number> = {};
   const num = (v: unknown): number | undefined =>
     typeof v === "number" && Number.isFinite(v) ? v : undefined;
+  const at = (path: string): number | undefined => {
+    let cur: unknown = usage;
+    for (const part of path.split(".")) {
+      if (cur === null || typeof cur !== "object") return undefined;
+      cur = (cur as Record<string, unknown>)[part];
+    }
+    return num(cur);
+  };
   const map: Array<[string, string]> = [
     ["input_tokens", "prompt_tokens"],
+    ["prompt_tokens", "prompt_tokens"],
     ["output_tokens", "completion_tokens"],
+    ["completion_tokens", "completion_tokens"],
     ["total_tokens", "tokens"],
+    ["tokens", "tokens"],
     ["cached_input_tokens", "prompt_cached_tokens"],
+    ["prompt_cached_tokens", "prompt_cached_tokens"],
+    ["input_tokens_details.cached_tokens", "prompt_cached_tokens"],
+    ["prompt_tokens_details.cached_tokens", "prompt_cached_tokens"],
+    ["prompt_cache_creation_tokens", "prompt_cache_creation_tokens"],
+    ["input_tokens_details.cache_creation_tokens", "prompt_cache_creation_tokens"],
+    ["input_tokens_details.cache_write_tokens", "prompt_cache_creation_tokens"],
+    ["prompt_tokens_details.cache_creation_tokens", "prompt_cache_creation_tokens"],
+    ["prompt_tokens_details.cache_write_tokens", "prompt_cache_creation_tokens"],
     ["reasoning_output_tokens", "completion_reasoning_tokens"],
+    ["completion_reasoning_tokens", "completion_reasoning_tokens"],
+    ["reasoning_tokens", "completion_reasoning_tokens"],
+    ["output_tokens_details.reasoning_tokens", "completion_reasoning_tokens"],
+    ["completion_tokens_details.reasoning_tokens", "completion_reasoning_tokens"],
+    ["cost", "cost"],
+    ["cost", "estimated_cost"],
+    ["estimated_cost", "estimated_cost"],
+    ["total_cost", "estimated_cost"],
+    ["cost_usd", "estimated_cost"],
   ];
   for (const [from, to] of map) {
-    const v = num(usage[from]);
+    if (metrics[to] !== undefined) continue;
+    const v = at(from);
     if (v !== undefined) metrics[to] = v;
+  }
+  if (
+    metrics.tokens === undefined &&
+    metrics.prompt_tokens !== undefined &&
+    metrics.completion_tokens !== undefined
+  ) {
+    metrics.tokens = metrics.prompt_tokens + metrics.completion_tokens;
   }
   return metrics;
 }
@@ -1467,6 +1503,15 @@ export class CodexEventProcessor implements EventProcessor {
     const info = (payload.info ?? {}) as Record<string, unknown>;
     const usage = (info.last_token_usage ?? {}) as Record<string, unknown>;
     const metrics = tokenMetrics(usage);
+    const metadata =
+      Object.keys(metrics).length === 0
+        ? {
+            usage_unavailable_reason:
+              Object.keys(usage).length === 0
+                ? "codex_token_count_missing_usage"
+                : "codex_token_count_unrecognized_usage",
+          }
+        : undefined;
     const { span, turnId, output, outputPreset, lastOutputTime } = scope.openLlm;
     // End the span when the model last generated (its last output item), NOT at
     // this token_count: Codex writes the token_count after the tool result (at
@@ -1476,7 +1521,11 @@ export class CodexEventProcessor implements EventProcessor {
     // Fall back to the token_count time if we somehow have no output time.
     const endTime = lastOutputTime ?? isoToUnixSeconds(record.timestamp);
     try {
-      span.log(outputPreset ? { metrics } : { output: llmOutput(output), metrics });
+      span.log(
+        outputPreset
+          ? { metrics, ...(metadata !== undefined ? { metadata } : {}) }
+          : { output: llmOutput(output), metrics, ...(metadata !== undefined ? { metadata } : {}) },
+      );
       span.end(endTime !== undefined ? { endTime } : undefined);
       // This LLM call is a child of its turn; advance the turn's boundary so the
       // next child (LLM or tool) starts where this one ended (its last output).
@@ -1501,7 +1550,8 @@ export class CodexEventProcessor implements EventProcessor {
     const { span, turnId, output, lastOutputTime } = scope.openLlm;
     const effectiveEnd = lastOutputTime ?? endTime;
     try {
-      if (output.length > 0) span.log({ output: llmOutput(output) });
+      const metadata = { usage_unavailable_reason: "codex_transcript_missing_token_count" };
+      span.log(output.length > 0 ? { output: llmOutput(output), metadata } : { metadata });
       span.end(effectiveEnd !== undefined ? { endTime: effectiveEnd } : undefined);
       this.noteChildEnded(scope, turnId, effectiveEnd);
     } catch (err) {
