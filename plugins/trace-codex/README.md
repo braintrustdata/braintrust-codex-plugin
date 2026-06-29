@@ -10,6 +10,8 @@ codex plugin add trace-codex@braintrust-codex-plugins
 # NOTE: tracing must be explicitly enabled
 # upon first run, codex will prompt for plugin permissions
 TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
+# to upgrade:
+codex plugin marketplace upgrade braintrust-codex-plugins
 ```
 
 ## Using the plugin in CI
