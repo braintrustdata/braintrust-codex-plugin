@@ -25,6 +25,13 @@ export interface Settings {
   project?: string;
   /** Master switch: when false or unset, no traces are reported to Braintrust. */
   traceToBraintrust?: boolean;
+  /**
+   * When true, the hook blocks at each turn's end (the Stop event) until the
+   * server confirms all events are processed and spans are flushed. Useful in
+   * programmatic/CI runs to guarantee traces are delivered before Codex exits.
+   * Defaults to false (fire-and-forget flush so the turn isn't stalled).
+   */
+  flushOnTurnEnd?: boolean;
   /** Extra metadata merged into the root span (standard keys win on conflict). */
   additionalMetadata?: Record<string, unknown>;
   /** If set, record every event to this NDJSON file (for replay). */
@@ -44,6 +51,7 @@ export const SETTINGS_TO_ENV: Record<keyof Settings, string> = {
   appUrl: "BRAINTRUST_APP_URL",
   project: "BRAINTRUST_PROJECT",
   traceToBraintrust: "TRACE_TO_BRAINTRUST",
+  flushOnTurnEnd: "BRAINTRUST_FLUSH_ON_TURN_END",
   additionalMetadata: "BRAINTRUST_ADDITIONAL_METADATA",
   recordFile: "BRAINTRUST_EVENT_SERVER_RECORD_FILE",
   port: "BRAINTRUST_EVENT_SERVER_PORT",
@@ -54,6 +62,8 @@ export const SETTINGS_TO_ENV: Record<keyof Settings, string> = {
 const SETTING_KEYS = Object.keys(SETTINGS_TO_ENV) as Array<keyof Settings>;
 
 const NUMBER_KEYS = new Set<keyof Settings>(["port", "idleTimeoutMs", "idleCheckIntervalMs"]);
+
+const BOOLEAN_KEYS = new Set<keyof Settings>(["traceToBraintrust", "flushOnTurnEnd"]);
 
 /**
  * The plugin's writable data directory, where config.json lives. Resolved
@@ -104,8 +114,8 @@ export function loadSettingsFile(path: string): Settings {
       if (typeof value === "number" && Number.isFinite(value)) {
         (settings as Record<string, unknown>)[key] = value;
       }
-    } else if (key === "traceToBraintrust") {
-      if (typeof value === "boolean") settings.traceToBraintrust = value;
+    } else if (BOOLEAN_KEYS.has(key)) {
+      if (typeof value === "boolean") (settings as Record<string, unknown>)[key] = value;
     } else if (key === "additionalMetadata") {
       if (typeof value === "object" && !Array.isArray(value)) {
         settings.additionalMetadata = value as Record<string, unknown>;

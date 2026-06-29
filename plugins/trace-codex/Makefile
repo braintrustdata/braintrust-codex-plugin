@@ -9,6 +9,14 @@
 #   make build         Compile the host binary (and per-platform binaries).
 #   make integration   Build, boot the server via the hook binary, health-check,
 #                      assert the version, then shut it down.
+#   make smoke         End-to-end: run a real `codex exec` session with the
+#                      installed plugin, traced to a local mock collector, and
+#                      assert >=1 trace row. Requires codex, bun, and
+#                      OPENAI_API_KEY; optionally SMOKE_VERSION to pin a release.
+#   make token-proxy   Run the token-counting proxy (debugging aid) that sits
+#                      between Codex and OpenAI and prints each call's token usage
+#                      for comparison against the trace. Requires OPENAI_API_KEY.
+#                      See scripts/token-proxy.ts for the config.toml snippet.
 #   make clean         Remove build artifacts.
 
 SHELL := /bin/bash
@@ -24,7 +32,7 @@ EXPECTED_VERSION := $(shell sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"
 BIN := bin/codex-hook
 BASE_URL := http://127.0.0.1:$(TEST_PORT)
 
-.PHONY: test lint typecheck unit build integration clean
+.PHONY: test lint typecheck unit build integration smoke token-proxy clean
 
 test: lint typecheck unit integration
 
@@ -80,6 +88,20 @@ integration: build
 	if [ "$$stopped" != "1" ]; then echo "FAIL: server still responding after shutdown"; exit 1; fi; \
 	echo "    -> server stopped cleanly"; \
 	echo "PASS: integration test"
+
+# End-to-end smoke test. Assumes the plugin is installed in Codex (run
+# `../../install.sh trace-codex` first for a local dev install). Set
+# SMOKE_VERSION to pin the release whose binary the launcher downloads; leave it
+# unset to use the installed plugin manifest version / local dev binary.
+smoke:
+	@echo "==> Smoke test"
+	SMOKE_RELEASE_VERSION="$(SMOKE_VERSION)" sh scripts/smoke-test.sh
+
+# Token-counting proxy for verifying trace-codex's token accounting. Run it, then
+# point Codex at it via a custom model_provider (see scripts/token-proxy.ts).
+token-proxy:
+	@echo "==> Token proxy (Ctrl-C for the session total)"
+	bun run scripts/token-proxy.ts
 
 clean:
 	@echo "==> Cleaning"

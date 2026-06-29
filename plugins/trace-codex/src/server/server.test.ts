@@ -127,4 +127,53 @@ describe("startServer", () => {
       await server.stop();
     }
   });
+
+  test("/flush waits for the queue to drain and processors to flush", async () => {
+    // /flush must return only after every enqueued event has been processed AND
+    // processors have been flushed (the idle flush runs before drained()
+    // resolves). Records ordering to prove flush happened before the response.
+    const events: string[] = [];
+    const factory: EventProcessorFactory = () => ({
+      process: async () => {
+        await sleep(20);
+        events.push("process");
+      },
+      flush: () => {
+        events.push("flush");
+      },
+    });
+
+    const server = startServer(
+      testConfig({ idleTimeoutMs: 60_000, idleCheckIntervalMs: 60_000 }),
+      new Map([["test", factory]]),
+      createTestLogger(),
+    );
+
+    try {
+      const enqueue = await fetch(`http://127.0.0.1:${server.port}/enqueue`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          queueId: "s1",
+          eventSource: "test",
+          eventSourceVersion: null,
+          eventName: "Stop",
+          eventData: {},
+        }),
+      });
+      expect(enqueue.status).toBe(200);
+
+      const flushRes = await fetch(`http://127.0.0.1:${server.port}/flush`, {
+        method: "POST",
+      });
+      expect(flushRes.status).toBe(200);
+      expect(await flushRes.json()).toEqual({ ok: true });
+
+      // By the time /flush returns, the event was processed and the idle flush
+      // ran.
+      expect(events).toEqual(["process", "flush"]);
+    } finally {
+      await server.stop();
+    }
+  });
 });

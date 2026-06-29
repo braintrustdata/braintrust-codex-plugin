@@ -83,11 +83,13 @@ export async function handleRequest(req: Request, deps: RouteDeps): Promise<Resp
   }
 
   // POST /flush
-  // Wait until everything enqueued so far has been processed and buffered spans
-  // have been flushed to the backend, then respond. Used by the hook client on
-  // terminal events (e.g. Codex "Stop") so the final spans are delivered before
-  // the process tree is torn down — important in short-lived environments like
-  // CI where the background server won't survive to flush on idle.
+  //
+  // Wait until everything enqueued so far has been processed AND buffered spans
+  // have been flushed to the backend, then respond. Used on terminal events /
+  // shutdown in short-lived environments (e.g. CI) where the background server
+  // won't survive to flush on idle, so the final spans must be delivered before
+  // the process tree is torn down. In normal interactive use the client doesn't
+  // call this — the server flushes on its own when the queue goes idle.
   if (path === "/flush" && req.method === "POST") {
     const flushed = await Promise.race([
       queue.drained().then(() => true),

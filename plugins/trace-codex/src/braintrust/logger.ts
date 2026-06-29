@@ -13,9 +13,64 @@ import type { Logger } from "../log.ts";
 
 export type { Span, StartSpanArgs };
 
+/**
+ * The minimal, serializable identity of a span: enough to recreate a handle
+ * bound to the same row after a restart, so further log()/end() calls merge into
+ * the original span server-side (rows are keyed by span_id). Captured from a live
+ * span's `spanId`/`rootSpanId`/`spanParents` getters (all synchronous).
+ */
+export interface SpanRef {
+  spanId: string;
+  rootSpanId: string;
+  /** Parent span ids (empty for a root span). */
+  spanParents: string[];
+  /**
+   * The span's name/type at capture time. Re-asserted on rehydration so the
+   * merged row keeps the original attributes — without them the SDK would infer
+   * a (wrong) name from the call stack when the rehydrated handle is created.
+   */
+  name?: string;
+  type?: StartSpanArgs["type"];
+  /**
+   * The span's original start time (Unix seconds). Re-asserted on rehydration so
+   * the merged row keeps its original start — without it the SDK stamps the start
+   * to the moment of rehydration (the resume time), corrupting the span's timing.
+   */
+  startTime?: number;
+}
+
+/**
+ * Capture a live span's identity for later rehydration. `name`/`type`/`startTime`
+ * are the attributes the span was created with (the SDK doesn't expose them as
+ * getters), passed by the caller so they can be re-asserted on resume.
+ */
+export function spanRef(
+  span: Span,
+  name?: string,
+  type?: StartSpanArgs["type"],
+  startTime?: number,
+): SpanRef {
+  return {
+    spanId: span.spanId,
+    rootSpanId: span.rootSpanId,
+    spanParents: span.spanParents,
+    ...(name !== undefined ? { name } : {}),
+    ...(type !== undefined ? { type } : {}),
+    ...(startTime !== undefined ? { startTime } : {}),
+  };
+}
+
 /** Creates root spans and can flush buffered events. */
 export interface SpanFactory {
   startSpan(args: StartSpanArgs): Span;
+  /**
+   * Recreate a handle bound to an existing span's identity (see {@link SpanRef}).
+   * The returned span carries the original span_id/root_span_id/parents, so
+   * subsequent log()/end() calls merge into that row rather than creating a new
+   * one. Used to resume a session's trace after the server restarted. The
+   * returned handle is "naked": it logs nothing until the caller does.
+   */
+  rehydrateSpan(ref: SpanRef): Span;
   flush(): Promise<void>;
 }
 
@@ -79,6 +134,14 @@ export function createSpanFactory(config?: ReportingConfig, diagLogger?: Logger)
   });
   return {
     startSpan: (args) => logger.startSpan(args),
+    rehydrateSpan: (ref) =>
+      logger.startSpan({
+        spanId: ref.spanId,
+        parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
+        ...(ref.name !== undefined ? { name: ref.name } : {}),
+        ...(ref.type !== undefined ? { type: ref.type } : {}),
+        ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
+      }),
     flush: async () => {
       try {
         await logger.flush();

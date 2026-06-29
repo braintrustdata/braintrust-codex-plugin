@@ -31,13 +31,14 @@ export async function postEnqueue(
 }
 
 /**
- * Ask the server to process everything enqueued so far and flush buffered spans
- * to the backend, then wait for it to confirm. Returns true on a 2xx response.
- * Never throws.
+ * Ask the server to flush, blocking until it confirms. Returns true on a 2xx
+ * response. Never throws.
  *
- * The hook calls this after a terminal event so the final spans are delivered
- * before the process tree is torn down (e.g. when a CI job ends right after the
- * agent's last turn, before the background server's idle timeout fires).
+ * The server waits until everything enqueued so far has been processed and
+ * buffered spans have reached the backend before responding. The hook uses this
+ * after a terminal event (only when block-on-stop is configured) so the final
+ * spans are delivered before the process tree is torn down (e.g. a CI job ending
+ * right after the agent's last turn, before the idle timeout fires).
  */
 export async function postFlush(
   config: Pick<Config, "host" | "port">,
@@ -46,8 +47,8 @@ export async function postFlush(
   try {
     const res = await fetch(`${serverBaseUrl(config)}/flush`, {
       method: "POST",
-      // The server bounds its own wait (FLUSH_TIMEOUT_MS); allow a little more
-      // here so we receive its response rather than aborting the request.
+      // The server bounds its wait by FLUSH_TIMEOUT_MS; allow a little more here
+      // so we receive its response rather than aborting first.
       signal: AbortSignal.timeout(12_000),
     });
     if (!res.ok) {

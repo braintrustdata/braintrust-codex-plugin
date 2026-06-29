@@ -70,6 +70,16 @@ describe("loadSettingsFile", () => {
     expect(loadSettingsFile(path)).toEqual({});
   });
 
+  test("parses flushOnTurnEnd boolean; ignores non-boolean", () => {
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: true })))).toEqual({
+      flushOnTurnEnd: true,
+    });
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: false })))).toEqual({
+      flushOnTurnEnd: false,
+    });
+    expect(loadSettingsFile(write(JSON.stringify({ flushOnTurnEnd: "yes" })))).toEqual({});
+  });
+
   test("missing file returns {}", () => {
     expect(loadSettingsFile(join(dir, "absent.json"))).toEqual({});
   });
@@ -124,6 +134,13 @@ describe("applySettingsToEnv", () => {
     applySettingsToEnv({ traceToBraintrust: true, additionalMetadata: { team: "platform" } }, env);
     expect(env.TRACE_TO_BRAINTRUST).toBe("true");
     expect(env.BRAINTRUST_ADDITIONAL_METADATA).toBe('{"team":"platform"}');
+  });
+
+  test("maps flushOnTurnEnd to BRAINTRUST_FLUSH_ON_TURN_END", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const applied = applySettingsToEnv({ flushOnTurnEnd: true }, env);
+    expect(env.BRAINTRUST_FLUSH_ON_TURN_END).toBe("true");
+    expect(applied).toEqual(["flushOnTurnEnd"]);
   });
 });
 

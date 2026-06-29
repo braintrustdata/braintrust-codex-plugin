@@ -22,6 +22,13 @@ function agentFactories(): Map<string, EventProcessorFactory> {
   return new Map(AGENTS.map((a) => [a.eventSource, a.createProcessor]));
 }
 
+/** Parse a boolean env var: true only for "true"/"1" (case-insensitive). */
+function parseBoolEnv(value: string | undefined): boolean {
+  if (!value) return false;
+  const v = value.trim().toLowerCase();
+  return v === "true" || v === "1";
+}
+
 async function main(): Promise<void> {
   const mode = process.argv[2] ?? "hook";
 
@@ -64,6 +71,8 @@ async function main(): Promise<void> {
   try {
     await runHookClient(config, logger, agent.buildEvents, {
       terminalEvents: agent.terminalEvents,
+      // Settings (above) have mapped BRAINTRUST_FLUSH_ON_TURN_END into env.
+      flushOnTurnEnd: parseBoolEnv(process.env.BRAINTRUST_FLUSH_ON_TURN_END),
     });
   } catch (err) {
     logger.error("unexpected hook client error", { error: String(err) });
