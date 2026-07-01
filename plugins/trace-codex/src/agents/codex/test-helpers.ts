@@ -228,7 +228,7 @@ export function reasoning(summary: string[] = []): TranscriptEntry {
  * token_count event: closes the current llm span. `usage` maps the Codex token
  * keys (input_tokens, output_tokens, total_tokens, ...) onto last_token_usage.
  */
-export function tokenCount(usage: Record<string, number> = {}): TranscriptEntry {
+export function tokenCount(usage: Record<string, unknown> = {}): TranscriptEntry {
   return transcript({
     type: "event_msg",
     payload: { type: "token_count", info: { last_token_usage: usage } },

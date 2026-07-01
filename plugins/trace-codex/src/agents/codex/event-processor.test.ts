@@ -1168,6 +1168,88 @@ describe("CodexEventProcessor: llm spans", () => {
     );
   });
 
+  test("llm token metrics normalize alternate and nested usage shapes", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "yo!" }),
+        assistantMessage("Hey."),
+        tokenCount({
+          prompt_tokens: 100,
+          completion_tokens: 14,
+          prompt_tokens_details: { cached_tokens: 25, cache_creation_tokens: 7 },
+          completion_tokens_details: { reasoning_tokens: 4 },
+          cost: 0.1234,
+        }),
+        taskComplete({ turn_id: "t1", last_agent_message: "Hey." }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: { role: "assistant", content: "Hey." },
+                metrics: {
+                  prompt_tokens: 100,
+                  completion_tokens: 14,
+                  tokens: 114,
+                  prompt_cached_tokens: 25,
+                  prompt_cache_creation_tokens: 7,
+                  completion_reasoning_tokens: 4,
+                  cost: 0.1234,
+                  estimated_cost: 0.1234,
+                },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("a dangling llm span records why token usage is unavailable", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        turnContext({ model: "gpt-5.5" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "yo!" }),
+        assistantMessage("Hey."),
+        taskComplete({ turn_id: "t1", last_agent_message: "Hey." }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              {
+                span_attributes: { name: "gpt-5.5", type: "llm" },
+                output: { role: "assistant", content: "Hey." },
+                metadata: { usage_unavailable_reason: "codex_transcript_missing_token_count" },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
   // A reasoning item with a readable summary is surfaced as a `reasoning` entry
   // in the llm output (Braintrust's OpenAI Responses shape), interleaved before
   // the assistant message.
