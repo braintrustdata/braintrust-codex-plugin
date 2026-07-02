@@ -24,6 +24,8 @@
 // tool calls, later) render in execution order. Buffered spans are delivered via
 // flush(). Everything is wrapped so tracing can never break a Codex turn.
 
+import { basename, dirname } from "node:path";
+
 import {
   defaultSpanFactoryProvider,
   type ReportingConfig,
@@ -410,6 +412,11 @@ interface PermissionInfo {
   prefix_rule?: unknown;
 }
 
+interface SkillLoadInfo {
+  skillName?: string;
+  skillPath?: string;
+}
+
 /**
  * Parse a tool call's permission/escalation request from its arguments. Codex
  * records an escalated retry's request inline in the function_call arguments
@@ -437,6 +444,81 @@ function permissionInfo(args: unknown): PermissionInfo | undefined {
   if (typeof obj.justification === "string") info.justification = obj.justification;
   if (obj.prefix_rule !== undefined) info.prefix_rule = obj.prefix_rule;
   return info;
+}
+
+function parseArgsObject(args: unknown): Record<string, unknown> | undefined {
+  if (typeof args === "string") {
+    try {
+      const parsed = JSON.parse(args) as unknown;
+      return parsed !== null && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+  return args !== null && typeof args === "object" ? (args as Record<string, unknown>) : undefined;
+}
+
+function stringCandidates(args: unknown): string[] {
+  const candidates: string[] = [];
+  if (typeof args === "string") candidates.push(args);
+  const obj = parseArgsObject(args);
+  if (obj !== undefined) {
+    for (const key of ["path", "file_path", "filePath", "file", "command", "cmd", "resource"]) {
+      const value = obj[key];
+      if (typeof value === "string") candidates.push(value);
+    }
+  }
+  return candidates;
+}
+
+function detectCodexSkillLoad(
+  toolName: string | undefined,
+  args: unknown,
+): SkillLoadInfo | undefined {
+  if (toolName === "skills.read") {
+    const obj = parseArgsObject(args);
+    const skillName =
+      typeof obj?.name === "string"
+        ? obj.name
+        : typeof obj?.package === "string"
+          ? obj.package
+          : undefined;
+    return {
+      skillName,
+    };
+  }
+
+  for (const candidate of stringCandidates(args)) {
+    const skillPath = candidate.match(/(?:^|[\s"'])([^\s"']*SKILL\.md)(?:$|[\s"'])/i)?.[1];
+    if (skillPath !== undefined) {
+      return {
+        skillName: basename(dirname(skillPath)),
+        skillPath,
+      };
+    }
+
+    const scriptPath = candidate.match(
+      /(?:^|[\s"'])([^\s"']*[\\/]scripts[\\/][^\s"']+)(?:$|[\s"'])/i,
+    )?.[1];
+    if (scriptPath !== undefined) {
+      return {
+        skillName: basename(dirname(dirname(scriptPath))),
+        skillPath: scriptPath,
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function skillLoadMetadata(info: SkillLoadInfo | undefined): Record<string, unknown> {
+  if (info === undefined) return {};
+  return {
+    ...(info.skillName !== undefined ? { skill_name: info.skillName } : {}),
+    ...(info.skillPath !== undefined ? { skill_path: info.skillPath } : {}),
+  };
 }
 
 // ConversationItems (chat messages / reasoning) are already plain JSON, so they
@@ -1649,21 +1731,31 @@ export class CodexEventProcessor implements EventProcessor {
     // If this call requested escalated permissions (Codex records the request
     // inline in the arguments), surface it on the span as metadata and a tag.
     const permission = permissionInfo(input);
+    const skillLoad = detectCodexSkillLoad(name, input);
     const startTime = isoToUnixSeconds(record.timestamp);
     const toolName = name ?? "tool";
+    const spanName =
+      skillLoad?.skillName !== undefined ? `skill: ${skillLoad.skillName}` : toolName;
     try {
       const toolSpan = this.trackSpan(
         turnSpan.startSpan({
-          name: toolName,
+          name: spanName,
           type: "tool",
           ...(startTime !== undefined ? { startTime } : {}),
           event: {
             input,
-            metadata: { tool_name: name, call_id: callId, turn_id: turnId, permission },
+            metadata: {
+              tool_name: skillLoad !== undefined ? "skill" : name,
+              ...(skillLoad !== undefined ? { original_tool_name: name } : {}),
+              call_id: callId,
+              turn_id: turnId,
+              permission,
+              ...skillLoadMetadata(skillLoad),
+            },
             ...(permission !== undefined ? { tags: [PERMISSION_TAG] } : {}),
           },
         }),
-        toolName,
+        spanName,
         "tool",
         startTime,
       );
