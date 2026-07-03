@@ -817,6 +817,149 @@ describe("CodexEventProcessor: permissions", () => {
     );
   });
 
+  test("an explicit $skill request is recorded on the turn and matching load span", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "$review inspect this" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "c1",
+          arguments: JSON.stringify({ command: "cat /home/user/.agents/skills/review/SKILL.md" }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "loaded" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            input: "$review inspect this",
+            metadata: {
+              turn_id: "t1",
+              loaded_skill_names: ["review"],
+              loaded_skills: [{ name: "review" }],
+            },
+            ended: true,
+            children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
+              {
+                span_attributes: { name: "skill: review", type: "tool" },
+                metadata: {
+                  tool_name: "skill",
+                  original_tool_name: "exec_command",
+                  call_id: "c1",
+                  skill_name: "review",
+                  skill_path: "/home/user/.agents/skills/review/SKILL.md",
+                  skill_load_trigger: "explicit",
+                },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("plain /skills does not create explicit skill metadata", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessage({ message: "/skills" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "c1",
+          arguments: JSON.stringify({ command: "cat /home/user/.agents/skills/review/SKILL.md" }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "loaded" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            metadata: {
+              turn_id: "t1",
+              loaded_skill_names: undefined,
+              loaded_skills: undefined,
+            },
+            ended: true,
+            children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
+              {
+                span_attributes: { name: "skill: review", type: "tool" },
+                metadata: { skill_name: "review", skill_load_trigger: undefined },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
+  test("visible injected skill fragments are recorded as explicit requests", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        userMessageItem('<skill name="review">---\nname: review\n---</skill>'),
+        functionCall({
+          turn_id: "t1",
+          name: "skills.read",
+          call_id: "c1",
+          arguments: JSON.stringify({ name: "review" }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "loaded" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            metadata: {
+              turn_id: "t1",
+              loaded_skill_names: ["review"],
+              loaded_skills: [{ name: "review" }],
+            },
+            ended: true,
+            children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
+              {
+                span_attributes: { name: "skill: review", type: "tool" },
+                metadata: {
+                  tool_name: "skill",
+                  original_tool_name: "skills.read",
+                  call_id: "c1",
+                  skill_name: "review",
+                  skill_load_trigger: "explicit",
+                },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
   test("an escalated tool call is annotated with permission metadata and a tag", async () => {
     await assertProducesTrace(
       [

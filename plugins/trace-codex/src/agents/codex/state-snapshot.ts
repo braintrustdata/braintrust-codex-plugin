@@ -62,6 +62,8 @@ export interface OpenTurnSnapshot {
   startTime: number | undefined;
   /** Max end time (Unix seconds) among the turn's already-ended children. */
   lastChildEndTime: number | undefined;
+  /** Explicit skill names requested by the user for this turn. */
+  explicitSkillNames?: string[];
 }
 
 /** Pending-subagent info captured before its root span exists. The parent turn
