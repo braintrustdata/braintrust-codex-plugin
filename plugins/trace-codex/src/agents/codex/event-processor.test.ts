@@ -774,6 +774,49 @@ describe("CodexEventProcessor: tool spans", () => {
 });
 
 describe("CodexEventProcessor: permissions", () => {
+  test("a SKILL.md read is normalized as a skill load tool span", async () => {
+    await assertProducesTrace(
+      [
+        sessionStart(),
+        sessionMeta({ cwd: "/work" }),
+        taskStarted({ turn_id: "t1" }),
+        functionCall({
+          turn_id: "t1",
+          name: "exec_command",
+          call_id: "c1",
+          arguments: JSON.stringify({ command: "cat /home/user/.agents/skills/review/SKILL.md" }),
+        }),
+        functionCallOutput({ call_id: "c1", output: "loaded" }),
+        taskComplete({ turn_id: "t1", last_agent_message: "done" }),
+        stop({ turn_id: "t1" }),
+      ],
+      {
+        span_attributes: { name: "codex: work", type: "task" },
+        ended: true,
+        children: [
+          {
+            span_attributes: { name: "turn: t1", type: "task" },
+            ended: true,
+            children: [
+              { span_attributes: { name: "llm", type: "llm" }, ended: true },
+              {
+                span_attributes: { name: "skill: review", type: "tool" },
+                metadata: {
+                  tool_name: "skill",
+                  original_tool_name: "exec_command",
+                  call_id: "c1",
+                  skill_name: "review",
+                  skill_path: "/home/user/.agents/skills/review/SKILL.md",
+                },
+                ended: true,
+              },
+            ],
+          },
+        ],
+      },
+    );
+  });
+
   test("an escalated tool call is annotated with permission metadata and a tag", async () => {
     await assertProducesTrace(
       [
