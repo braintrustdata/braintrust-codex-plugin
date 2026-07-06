@@ -802,8 +802,8 @@ describe("CodexEventProcessor: permissions", () => {
               {
                 span_attributes: { name: "skill: review", type: "tool" },
                 metadata: {
-                  tool_name: "skill",
-                  original_tool_name: "exec_command",
+                  tool_name: "exec_command",
+                  tool_kind: "skill",
                   call_id: "c1",
                   skill_name: "review",
                   skill_path: "/home/user/.agents/skills/review/SKILL.md",
@@ -852,8 +852,8 @@ describe("CodexEventProcessor: permissions", () => {
               {
                 span_attributes: { name: "skill: review", type: "tool" },
                 metadata: {
-                  tool_name: "skill",
-                  original_tool_name: "exec_command",
+                  tool_name: "exec_command",
+                  tool_kind: "skill",
                   call_id: "c1",
                   skill_name: "review",
                   skill_path: "/home/user/.agents/skills/review/SKILL.md",
@@ -945,8 +945,8 @@ describe("CodexEventProcessor: permissions", () => {
               {
                 span_attributes: { name: "skill: review", type: "tool" },
                 metadata: {
-                  tool_name: "skill",
-                  original_tool_name: "skills.read",
+                  tool_name: "skills.read",
+                  tool_kind: "skill",
                   call_id: "c1",
                   skill_name: "review",
                   skill_load_trigger: "explicit",

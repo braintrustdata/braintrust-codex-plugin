@@ -1856,8 +1856,8 @@ export class CodexEventProcessor implements EventProcessor {
           event: {
             input,
             metadata: {
-              tool_name: skillLoad !== undefined ? "skill" : name,
-              ...(skillLoad !== undefined ? { original_tool_name: name } : {}),
+              tool_name: name,
+              ...(skillLoad !== undefined ? { tool_kind: "skill" } : {}),
               call_id: callId,
               turn_id: turnId,
               permission,
