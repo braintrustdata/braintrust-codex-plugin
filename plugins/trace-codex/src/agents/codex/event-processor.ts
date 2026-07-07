@@ -35,6 +35,7 @@ import {
   type SpanRef,
   spanRef,
 } from "../../braintrust/logger.ts";
+import { gitMetadataForCwd } from "../../git-metadata.ts";
 import type { Logger } from "../../log.ts";
 import type { EventProcessor } from "../../processor/event-processor.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
@@ -1239,6 +1240,7 @@ export class CodexEventProcessor implements EventProcessor {
     const cwd = typeof payload.cwd === "string" ? payload.cwd : undefined;
     const sessionId = typeof payload.id === "string" ? payload.id : this.queueId;
     const startTime = isoToUnixSeconds(record.timestamp);
+    const gitMetadata = gitMetadataForCwd(cwd);
 
     const projectDir = projectDirName(cwd);
     const spanName = projectDir ? `codex: ${projectDir}` : "codex session";
@@ -1257,6 +1259,7 @@ export class CodexEventProcessor implements EventProcessor {
               session_id: sessionId,
               model: this.mainScope?.model,
               cwd,
+              ...gitMetadata,
               source: this.rootEnrichment.source,
               permission_mode: this.rootEnrichment.permissionMode,
               cli_version:
