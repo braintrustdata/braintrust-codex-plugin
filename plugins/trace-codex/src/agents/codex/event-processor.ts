@@ -222,6 +222,8 @@ interface OpenTurn {
   startTime: number | undefined;
   /** Max end time (Unix seconds) among this turn's already-ended children. */
   lastChildEndTime: number | undefined;
+  /** Explicit skill names requested by the user for this turn. */
+  explicitSkillNames: string[];
 }
 
 /**
@@ -417,6 +419,11 @@ interface SkillLoadInfo {
   skillPath?: string;
 }
 
+interface ExplicitSkillRequestMetadata extends Record<string, unknown> {
+  loaded_skill_names: string[];
+  loaded_skills: Array<{ name: string }>;
+}
+
 /**
  * Parse a tool call's permission/escalation request from its arguments. Codex
  * records an escalated retry's request inline in the function_call arguments
@@ -471,6 +478,84 @@ function stringCandidates(args: unknown): string[] {
     }
   }
   return candidates;
+}
+
+function normalizeExplicitSkillName(name: string): string | undefined {
+  const normalized = name
+    .trim()
+    .replace(/^\$+/, "")
+    .replace(/[),.;]+$/, "");
+  return normalized ? normalized : undefined;
+}
+
+function explicitSkillRequestMetadata(
+  names: readonly string[],
+): ExplicitSkillRequestMetadata | undefined {
+  const seen = new Set<string>();
+  const loaded_skill_names: string[] = [];
+  for (const name of names) {
+    const normalized = normalizeExplicitSkillName(name);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    loaded_skill_names.push(normalized);
+  }
+  if (loaded_skill_names.length === 0) return undefined;
+  return {
+    loaded_skill_names,
+    loaded_skills: loaded_skill_names.map((name) => ({ name })),
+  };
+}
+
+function explicitSkillNamesFromText(text: string): string[] {
+  const names: string[] = [];
+
+  for (const match of text.matchAll(/\$([A-Za-z0-9_.:-]+)/g)) {
+    names.push(match[1] ?? "");
+  }
+
+  for (const match of text.matchAll(/(?:^|\s)\/skills\s+([A-Za-z0-9_.:-]+)/g)) {
+    names.push(match[1] ?? "");
+  }
+
+  for (const match of text.matchAll(/skill:\/\/([A-Za-z0-9_.:-]+)/g)) {
+    names.push(match[1] ?? "");
+  }
+
+  for (const match of text.matchAll(/(?:^|[\s"'])([^\s"']*SKILL\.md)(?:$|[\s"'])/gi)) {
+    const skillPath = match[1];
+    if (skillPath !== undefined) names.push(basename(dirname(skillPath)));
+  }
+
+  for (const match of text.matchAll(/UserInput::Skill\(([^)]*)\)/g)) {
+    const raw = match[1] ?? "";
+    const name = raw.match(/(?:name|skill|id)\s*[:=]\s*["']?([A-Za-z0-9_.:-]+)/)?.[1];
+    if (name !== undefined) names.push(name);
+  }
+
+  for (const match of text.matchAll(/<skill\b([^>]*)>([\s\S]*?)<\/skill>/gi)) {
+    const attrs = match[1] ?? "";
+    const body = match[2] ?? "";
+    const attrName = attrs.match(/\b(?:name|id)=["']([^"']+)["']/)?.[1];
+    if (attrName !== undefined) names.push(attrName);
+    const frontmatterName = body.match(/(?:^|\n)name:\s*([A-Za-z0-9_.:-]+)/)?.[1];
+    if (frontmatterName !== undefined) names.push(frontmatterName);
+  }
+
+  return explicitSkillRequestMetadata(names)?.loaded_skill_names ?? [];
+}
+
+function addExplicitSkillNames(turn: OpenTurn, names: readonly string[]): string[] {
+  const metadata = explicitSkillRequestMetadata([...turn.explicitSkillNames, ...names]);
+  turn.explicitSkillNames = metadata?.loaded_skill_names ?? [];
+  return turn.explicitSkillNames;
+}
+
+function skillLoadTriggerForTurn(
+  turn: OpenTurn,
+  skillLoad: SkillLoadInfo | undefined,
+): "explicit" | undefined {
+  if (skillLoad?.skillName === undefined) return undefined;
+  return turn.explicitSkillNames.includes(skillLoad.skillName) ? "explicit" : undefined;
 }
 
 function detectCodexSkillLoad(
@@ -1256,7 +1341,12 @@ export class CodexEventProcessor implements EventProcessor {
         "task",
         startTime,
       );
-      scope.openTurns.set(turnId, { span: turnSpan, startTime, lastChildEndTime: undefined });
+      scope.openTurns.set(turnId, {
+        span: turnSpan,
+        startTime,
+        lastChildEndTime: undefined,
+        explicitSkillNames: [],
+      });
       this.logger.info("codex processor: opened turn span", {
         queueId: this.queueId,
         turnId,
@@ -1412,9 +1502,27 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
     try {
-      turn.span.log({ input: prompt });
+      const names = explicitSkillNamesFromText(prompt);
+      const loadedSkillMetadata = explicitSkillRequestMetadata(addExplicitSkillNames(turn, names));
+      turn.span.log({ input: prompt, metadata: loadedSkillMetadata });
     } catch (err) {
       this.logger.error("codex processor: failed to set turn input", {
+        queueId: this.queueId,
+        error: String(err),
+      });
+    }
+  }
+
+  private annotateLatestTurnWithExplicitSkills(scope: TranscriptScope, text: string): void {
+    const turn = this.latestOpenTurn(scope);
+    if (turn === undefined) return;
+    const names = explicitSkillNamesFromText(text);
+    const loadedSkillMetadata = explicitSkillRequestMetadata(addExplicitSkillNames(turn, names));
+    if (loadedSkillMetadata === undefined) return;
+    try {
+      turn.span.log({ metadata: loadedSkillMetadata });
+    } catch (err) {
+      this.logger.error("codex processor: failed to annotate explicit skill request", {
         queueId: this.queueId,
         error: String(err),
       });
@@ -1554,6 +1662,8 @@ export class CodexEventProcessor implements EventProcessor {
       this.ensureLlmSpan(scope, record);
       scope.openLlm?.output.push(msg);
       this.noteLlmOutputTime(scope, record);
+    } else if (role === "user") {
+      this.annotateLatestTurnWithExplicitSkills(scope, text);
     }
     scope.conversationHistory.push(msg);
   }
@@ -1732,6 +1842,7 @@ export class CodexEventProcessor implements EventProcessor {
     // inline in the arguments), surface it on the span as metadata and a tag.
     const permission = permissionInfo(input);
     const skillLoad = detectCodexSkillLoad(name, input);
+    const skillLoadTrigger = skillLoadTriggerForTurn(turn, skillLoad);
     const startTime = isoToUnixSeconds(record.timestamp);
     const toolName = name ?? "tool";
     const spanName =
@@ -1745,12 +1856,13 @@ export class CodexEventProcessor implements EventProcessor {
           event: {
             input,
             metadata: {
-              tool_name: skillLoad !== undefined ? "skill" : name,
-              ...(skillLoad !== undefined ? { original_tool_name: name } : {}),
+              tool_name: name,
+              ...(skillLoad !== undefined ? { tool_kind: "skill" } : {}),
               call_id: callId,
               turn_id: turnId,
               permission,
               ...skillLoadMetadata(skillLoad),
+              ...(skillLoadTrigger !== undefined ? { skill_load_trigger: skillLoadTrigger } : {}),
             },
             ...(permission !== undefined ? { tags: [PERMISSION_TAG] } : {}),
           },
@@ -2093,6 +2205,7 @@ export class CodexEventProcessor implements EventProcessor {
           span: this.refFor(turn.span),
           startTime: turn.startTime,
           lastChildEndTime: turn.lastChildEndTime,
+          explicitSkillNames: turn.explicitSkillNames,
         })),
         turnsAwaitingCompletion: Array.from(scope.turnsAwaitingCompletion),
         conversationHistory: toItemSnapshots(scope.conversationHistory),
@@ -2227,6 +2340,7 @@ export class CodexEventProcessor implements EventProcessor {
               span: rehydrate(t.span),
               startTime: t.startTime,
               lastChildEndTime: t.lastChildEndTime,
+              explicitSkillNames: t.explicitSkillNames ?? [],
             },
           ]),
         ),
