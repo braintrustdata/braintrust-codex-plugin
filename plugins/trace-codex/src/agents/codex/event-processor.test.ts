@@ -1,4 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ReportingConfig, SpanFactory } from "../../braintrust/logger.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
 import { createTestLogger, spansToTree, withCapturedTrace } from "../../test-helpers.ts";
@@ -40,6 +44,32 @@ import type {
   TranscriptWaitResult,
   WaitForOptions,
 } from "./transcript-reader.ts";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+  while (tempDirs.length > 0) {
+    const dir = tempDirs.pop();
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function makeGitRepo(): { dir: string; commit: string } {
+  const dir = mkdtempSync(join(tmpdir(), "codex-git-metadata-"));
+  tempDirs.push(dir);
+  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir });
+  writeFileSync(join(dir, "README.md"), "hello\n");
+  execFileSync("git", ["add", "README.md"], { cwd: dir });
+  execFileSync("git", ["commit", "-m", "init"], { cwd: dir, stdio: "ignore" });
+  execFileSync("git", ["branch", "-M", "main"], { cwd: dir });
+  execFileSync("git", ["remote", "add", "origin", "https://token@github.com/acme/app.git"], {
+    cwd: dir,
+  });
+  const commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
+  return { dir, commit };
+}
 
 // Helpers below build a session as an ordered list of transcript writes and
 // hooks. The final `stop()` hook triggers the catch-up that turns the buffered
@@ -105,6 +135,20 @@ describe("CodexEventProcessor: root span", () => {
         children: [],
       },
     );
+  });
+
+  test("root span metadata includes minimal git attribution fields", async () => {
+    const repo = makeGitRepo();
+
+    await assertProducesTrace([sessionStart(), sessionMeta({ cwd: repo.dir }), stop({})], {
+      span_attributes: { type: "task" },
+      metadata: {
+        git_origin_url: "https://github.com/acme/app.git",
+        git_branch: "main",
+        git_commit_sha: repo.commit,
+      },
+      children: [],
+    });
   });
 
   test("duplicate session_meta still yields a single root span", async () => {
