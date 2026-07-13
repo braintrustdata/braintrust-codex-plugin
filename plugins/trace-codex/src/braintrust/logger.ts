@@ -10,6 +10,7 @@
 
 import { initLogger, type Span, type StartSpanArgs } from "braintrust";
 import type { Logger } from "../log.ts";
+import { PLUGIN_VERSION } from "../version.ts";
 
 export type { Span, StartSpanArgs };
 
@@ -90,6 +91,57 @@ export interface ReportingConfig {
   additionalMetadata?: Record<string, unknown>;
 }
 
+type SpanOriginEnvironment = { type: string; name?: string };
+
+function detectEnvironment(env: NodeJS.ProcessEnv = process.env): SpanOriginEnvironment | undefined {
+  if (env.BRAINTRUST_ENVIRONMENT_TYPE) {
+    return env.BRAINTRUST_ENVIRONMENT_NAME
+      ? { type: env.BRAINTRUST_ENVIRONMENT_TYPE, name: env.BRAINTRUST_ENVIRONMENT_NAME }
+      : { type: env.BRAINTRUST_ENVIRONMENT_TYPE };
+  }
+  if (env.GITHUB_ACTIONS) return { type: "ci", name: "github_actions" };
+  if (env.GITLAB_CI) return { type: "ci", name: "gitlab_ci" };
+  if (env.CIRCLECI) return { type: "ci", name: "circleci" };
+  if (env.BUILDKITE) return { type: "ci", name: "buildkite" };
+  if (env.CI) return { type: "ci", name: "ci" };
+  if (env.VERCEL) return { type: "server", name: "vercel" };
+  if (env.NETLIFY) return { type: "server", name: "netlify" };
+  if (env.NODE_ENV === "production" || env.NODE_ENV === "staging") {
+    return { type: "server", name: env.NODE_ENV };
+  }
+  if (env.NODE_ENV === "development" || env.NODE_ENV === "local") {
+    return { type: "local", name: env.NODE_ENV };
+  }
+  return undefined;
+}
+
+function pluginContext() {
+  const environment = detectEnvironment();
+  return {
+    span_origin: {
+      name: "braintrust.plugin.codex",
+      version: PLUGIN_VERSION,
+      instrumentation: { name: "codex-event-processor" },
+      ...(environment ? { environment } : {}),
+    },
+  };
+}
+
+function withPluginContext(args: StartSpanArgs): StartSpanArgs {
+  const event = (args.event ?? {}) as Record<string, unknown>;
+  const eventWithContext = {
+    ...event,
+    context: {
+      ...((event.context as Record<string, unknown> | undefined) ?? {}),
+      ...pluginContext(),
+    },
+  } as StartSpanArgs["event"];
+  return {
+    ...args,
+    event: eventWithContext,
+  };
+}
+
 /**
  * Builds a SpanFactory for a given reporting config. Injected into processors so
  * each session can create its own logger, and so tests can stay offline by
@@ -133,15 +185,15 @@ export function createSpanFactory(config?: ReportingConfig, diagLogger?: Logger)
     hasApiKey: Boolean(config?.apiKey ?? process.env.BRAINTRUST_API_KEY),
   });
   return {
-    startSpan: (args) => logger.startSpan(args),
+    startSpan: (args) => logger.startSpan(withPluginContext(args)),
     rehydrateSpan: (ref) =>
-      logger.startSpan({
+      logger.startSpan(withPluginContext({
         spanId: ref.spanId,
         parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
         ...(ref.name !== undefined ? { name: ref.name } : {}),
         ...(ref.type !== undefined ? { type: ref.type } : {}),
         ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
-      }),
+      })),
     flush: async () => {
       try {
         await logger.flush();
