@@ -93,7 +93,9 @@ export interface ReportingConfig {
 
 type SpanOriginEnvironment = { type: string; name?: string };
 
-function detectEnvironment(env: NodeJS.ProcessEnv = process.env): SpanOriginEnvironment | undefined {
+function detectEnvironment(
+  env: NodeJS.ProcessEnv = process.env,
+): SpanOriginEnvironment | undefined {
   if (env.BRAINTRUST_ENVIRONMENT_TYPE) {
     return env.BRAINTRUST_ENVIRONMENT_NAME
       ? { type: env.BRAINTRUST_ENVIRONMENT_TYPE, name: env.BRAINTRUST_ENVIRONMENT_NAME }
@@ -187,13 +189,15 @@ export function createSpanFactory(config?: ReportingConfig, diagLogger?: Logger)
   return {
     startSpan: (args) => logger.startSpan(withPluginContext(args)),
     rehydrateSpan: (ref) =>
-      logger.startSpan(withPluginContext({
-        spanId: ref.spanId,
-        parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
-        ...(ref.name !== undefined ? { name: ref.name } : {}),
-        ...(ref.type !== undefined ? { type: ref.type } : {}),
-        ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
-      })),
+      logger.startSpan(
+        withPluginContext({
+          spanId: ref.spanId,
+          parentSpanIds: { parentSpanIds: ref.spanParents, rootSpanId: ref.rootSpanId },
+          ...(ref.name !== undefined ? { name: ref.name } : {}),
+          ...(ref.type !== undefined ? { type: ref.type } : {}),
+          ...(ref.startTime !== undefined ? { startTime: ref.startTime } : {}),
+        }),
+      ),
     flush: async () => {
       try {
         await logger.flush();
