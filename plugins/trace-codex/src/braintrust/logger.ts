@@ -91,15 +91,16 @@ export interface ReportingConfig {
   additionalMetadata?: Record<string, unknown>;
 }
 
-type SpanOriginEnvironment = { type: string; name?: string };
+type SpanOriginEnvironment = { type?: string; name?: string };
 
 function detectEnvironment(
   env: NodeJS.ProcessEnv = process.env,
 ): SpanOriginEnvironment | undefined {
-  if (env.BRAINTRUST_ENVIRONMENT_TYPE) {
-    return env.BRAINTRUST_ENVIRONMENT_NAME
-      ? { type: env.BRAINTRUST_ENVIRONMENT_TYPE, name: env.BRAINTRUST_ENVIRONMENT_NAME }
-      : { type: env.BRAINTRUST_ENVIRONMENT_TYPE };
+  if (env.BRAINTRUST_ENVIRONMENT_TYPE || env.BRAINTRUST_ENVIRONMENT_NAME) {
+    return {
+      ...(env.BRAINTRUST_ENVIRONMENT_TYPE ? { type: env.BRAINTRUST_ENVIRONMENT_TYPE } : {}),
+      ...(env.BRAINTRUST_ENVIRONMENT_NAME ? { name: env.BRAINTRUST_ENVIRONMENT_NAME } : {}),
+    };
   }
   if (env.GITHUB_ACTIONS) return { type: "ci", name: "github_actions" };
   if (env.GITLAB_CI) return { type: "ci", name: "gitlab_ci" };
