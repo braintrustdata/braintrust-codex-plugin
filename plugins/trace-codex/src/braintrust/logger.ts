@@ -108,6 +108,16 @@ function detectEnvironment(
   if (env.CI) return { type: "ci", name: "ci" };
   if (env.VERCEL) return { type: "server", name: "vercel" };
   if (env.NETLIFY) return { type: "server", name: "netlify" };
+  if (
+    env.ECS_CONTAINER_METADATA_URI ||
+    env.ECS_CONTAINER_METADATA_URI_V4 ||
+    env.AWS_EXECUTION_ENV?.startsWith("AWS_ECS_")
+  ) {
+    return { type: "server", name: "ecs" };
+  }
+  if (env.AWS_LAMBDA_FUNCTION_NAME || env.AWS_EXECUTION_ENV?.startsWith("AWS_Lambda_")) {
+    return { type: "server", name: "aws_lambda" };
+  }
   if (env.NODE_ENV === "production" || env.NODE_ENV === "staging") {
     return { type: "server", name: env.NODE_ENV };
   }
