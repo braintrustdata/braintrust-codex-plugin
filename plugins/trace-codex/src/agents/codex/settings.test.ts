@@ -65,6 +65,14 @@ describe("loadSettingsFile", () => {
     });
   });
 
+  test("parses parentSpanId and rootSpanId", () => {
+    const path = write(JSON.stringify({ parentSpanId: "parent-1", rootSpanId: "root-1" }));
+    expect(loadSettingsFile(path)).toEqual({
+      parentSpanId: "parent-1",
+      rootSpanId: "root-1",
+    });
+  });
+
   test("ignores non-boolean traceToBraintrust and non-object/array metadata", () => {
     const path = write(JSON.stringify({ traceToBraintrust: "yes", additionalMetadata: [1, 2] }));
     expect(loadSettingsFile(path)).toEqual({});
@@ -141,6 +149,14 @@ describe("applySettingsToEnv", () => {
     const applied = applySettingsToEnv({ flushOnTurnEnd: true }, env);
     expect(env.BRAINTRUST_FLUSH_ON_TURN_END).toBe("true");
     expect(applied).toEqual(["flushOnTurnEnd"]);
+  });
+
+  test("maps parentSpanId/rootSpanId to CODEX env vars", () => {
+    const env: NodeJS.ProcessEnv = {};
+    const applied = applySettingsToEnv({ parentSpanId: "parent-1", rootSpanId: "root-1" }, env);
+    expect(env.CODEX_PARENT_SPAN_ID).toBe("parent-1");
+    expect(env.CODEX_ROOT_SPAN_ID).toBe("root-1");
+    expect(applied).toEqual(["parentSpanId", "rootSpanId"]);
   });
 });
 

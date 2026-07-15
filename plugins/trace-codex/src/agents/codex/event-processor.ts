@@ -1188,6 +1188,8 @@ export class CodexEventProcessor implements EventProcessor {
         !Array.isArray(data.additionalMetadata)
           ? (data.additionalMetadata as Record<string, unknown>)
           : undefined,
+      parentSpanId: typeof data.parentSpanId === "string" ? data.parentSpanId : undefined,
+      rootSpanId: typeof data.rootSpanId === "string" ? data.rootSpanId : undefined,
     };
     this.logger.info("codex processor: configured reporting", {
       queueId: this.queueId,
@@ -1195,6 +1197,7 @@ export class CodexEventProcessor implements EventProcessor {
       apiUrl: this.reportingConfig.apiUrl,
       hasApiKey: Boolean(this.reportingConfig.apiKey),
       traceToBraintrust: this.reportingConfig.traceToBraintrust,
+      hasParentSpan: Boolean(this.reportingConfig.parentSpanId),
     });
   }
 
@@ -1250,6 +1253,14 @@ export class CodexEventProcessor implements EventProcessor {
         this.spanFactory.startSpan({
           name: spanName,
           type: "task",
+          ...(this.reportingConfig?.parentSpanId && this.reportingConfig?.rootSpanId
+            ? {
+                parentSpanIds: {
+                  parentSpanIds: [this.reportingConfig.parentSpanId],
+                  rootSpanId: this.reportingConfig.rootSpanId,
+                },
+              }
+            : {}),
           ...(startTime !== undefined ? { startTime } : {}),
           event: {
             input: { model: this.mainScope?.model, cwd, source: this.rootEnrichment.source },

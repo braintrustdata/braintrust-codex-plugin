@@ -23,6 +23,11 @@ function parseBoolEnv(value: string | undefined): boolean {
   return v === "true" || v === "1";
 }
 
+function nonEmptyEnv(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 /** Resolve the reporting config from the (already settings-applied) environment. */
 export function resolveReportingConfig(env: NodeJS.ProcessEnv = process.env): ReportingConfig {
   const config: ReportingConfig = {};
@@ -34,6 +39,13 @@ export function resolveReportingConfig(env: NodeJS.ProcessEnv = process.env): Re
 
   // Master switch: off unless explicitly enabled.
   config.traceToBraintrust = parseBoolEnv(env.TRACE_TO_BRAINTRUST);
+
+  const parentSpanId = nonEmptyEnv(env.CODEX_PARENT_SPAN_ID);
+  const rootSpanId = nonEmptyEnv(env.CODEX_ROOT_SPAN_ID);
+  const normalizedParentSpanId = parentSpanId ?? rootSpanId;
+  const normalizedRootSpanId = rootSpanId ?? parentSpanId;
+  if (normalizedParentSpanId !== undefined) config.parentSpanId = normalizedParentSpanId;
+  if (normalizedRootSpanId !== undefined) config.rootSpanId = normalizedRootSpanId;
 
   // Additional metadata: a JSON object. Ignore anything that isn't one.
   const rawMeta = env.BRAINTRUST_ADDITIONAL_METADATA;

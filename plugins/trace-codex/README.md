@@ -76,8 +76,26 @@ Every setting can be provided as a `config.json` key or as an environment variab
 | `project`            | `BRAINTRUST_PROJECT`                  | _(unset)_          | Project to log traces into.                                                                                                                  |
 | `apiUrl`             | `BRAINTRUST_API_URL`                  | api.braintrust.dev | Braintrust API URL.                                                                                                                          |
 | `additionalMetadata` | `BRAINTRUST_ADDITIONAL_METADATA`      | _(unset)_          | JSON object of extra metadata merged into the root span. Standard keys (`session_id`, `model`, `project`, etc.) take precedence on conflict. |
+| `parentSpanId`       | `CODEX_PARENT_SPAN_ID`                | _(unset)_          | Existing Braintrust span to attach the Codex session under. If `rootSpanId` is unset, this is also used as the trace root.                   |
+| `rootSpanId`         | `CODEX_ROOT_SPAN_ID`                  | _(unset)_          | Root span id for the existing trace. If `parentSpanId` is unset, this is also used as the parent.                                            |
 | `flushOnTurnEnd`     | `BRAINTRUST_FLUSH_ON_TURN_END`        | `false`            | When `true`, the hook blocks at each turn's end (the `Stop` event) until the server confirms all spans are flushed. Use in programmatic/CI runs to guarantee traces are delivered before Codex exits. |
 | `recordFile`         | `BRAINTRUST_EVENT_SERVER_RECORD_FILE` | _(unset)_          | If set, record every event to this NDJSON file (for `replay`).                                                                               |
+
+### Add a Codex trace to an existing trace
+
+You can attach a Codex session to an existing Braintrust trace by passing `CODEX_PARENT_SPAN_ID`:
+
+```bash
+TRACE_TO_BRAINTRUST=true CODEX_PARENT_SPAN_ID=your-parent-span-id codex
+```
+
+If the parent span is not the trace root, also pass `CODEX_ROOT_SPAN_ID`:
+
+```bash
+TRACE_TO_BRAINTRUST=true CODEX_PARENT_SPAN_ID=parent-span-id CODEX_ROOT_SPAN_ID=root-span-id codex
+```
+
+The Codex session and all its turns/tools will appear as children of your parent span in Braintrust.
 
 ### Resuming sessions
 
