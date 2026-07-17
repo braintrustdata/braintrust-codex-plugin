@@ -89,6 +89,10 @@ export interface ReportingConfig {
   traceToBraintrust?: boolean;
   /** Extra metadata merged into the root span (standard keys win on conflict). */
   additionalMetadata?: Record<string, unknown>;
+  /** Existing Braintrust span to attach the Codex session under. */
+  parentSpanId?: string;
+  /** Root span id for the existing trace when attaching under a parent span. */
+  rootSpanId?: string;
 }
 
 type SpanOriginEnvironment = { type?: string; name?: string };

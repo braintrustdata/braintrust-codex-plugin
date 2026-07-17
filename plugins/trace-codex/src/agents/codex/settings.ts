@@ -34,6 +34,10 @@ export interface Settings {
   flushOnTurnEnd?: boolean;
   /** Extra metadata merged into the root span (standard keys win on conflict). */
   additionalMetadata?: Record<string, unknown>;
+  /** Existing Braintrust span to attach the Codex session under. */
+  parentSpanId?: string;
+  /** Root span id for the existing trace when attaching under a parent span. */
+  rootSpanId?: string;
   /** If set, record every event to this NDJSON file (for replay). */
   recordFile?: string;
   /** Local event server port. */
@@ -53,6 +57,8 @@ export const SETTINGS_TO_ENV: Record<keyof Settings, string> = {
   traceToBraintrust: "TRACE_TO_BRAINTRUST",
   flushOnTurnEnd: "BRAINTRUST_FLUSH_ON_TURN_END",
   additionalMetadata: "BRAINTRUST_ADDITIONAL_METADATA",
+  parentSpanId: "CODEX_PARENT_SPAN_ID",
+  rootSpanId: "CODEX_ROOT_SPAN_ID",
   recordFile: "BRAINTRUST_EVENT_SERVER_RECORD_FILE",
   port: "BRAINTRUST_EVENT_SERVER_PORT",
   idleTimeoutMs: "BRAINTRUST_EVENT_SERVER_IDLE_TIMEOUT_MS",

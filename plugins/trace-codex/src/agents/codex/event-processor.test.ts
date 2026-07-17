@@ -5,7 +5,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ReportingConfig, SpanFactory } from "../../braintrust/logger.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
-import { createTestLogger, spansToTree, withCapturedTrace } from "../../test-helpers.ts";
+import {
+  createTestLogger,
+  mergeCapturedSpans,
+  spansToTree,
+  withCapturedTrace,
+} from "../../test-helpers.ts";
 import { CODEX_CONFIG_EVENT } from "./event-builder.ts";
 import { CodexEventProcessor } from "./event-processor.ts";
 import {
@@ -164,6 +169,46 @@ describe("CodexEventProcessor: root span", () => {
       ended: true,
       children: [],
     });
+  });
+
+  test("root span can attach to a configured parent trace", async () => {
+    const reader = new FakeTranscriptReader();
+    const trace = withCapturedTrace();
+    try {
+      const processor = new CodexEventProcessor(
+        "session-1",
+        createTestLogger(),
+        () => trace.spanFactory,
+        reader,
+      );
+
+      await processor.process(
+        configEvent({ parentSpanId: "parent-span", rootSpanId: "root-span" }),
+      );
+      await processor.process(sessionStart());
+      reader.append(JSON.stringify(sessionMeta({ cwd: "/work" }).record));
+      reader.append(JSON.stringify(taskStarted({ turn_id: "t1" }).record));
+      reader.append(JSON.stringify(userMessage({ message: "hello" }).record));
+      reader.append(
+        JSON.stringify(taskComplete({ turn_id: "t1", last_agent_message: "done" }).record),
+      );
+      await processor.process(stop({ turn_id: "t1" }));
+      await processor.flush();
+
+      const spans = mergeCapturedSpans(await trace.drain());
+      const root = spans.find((s) => s.span_attributes?.name === "codex: work");
+      expect(root).toBeDefined();
+      if (root === undefined) throw new Error("expected Codex root span");
+      expect(root?.root_span_id).toBe("root-span");
+      expect(root?.span_parents).toEqual(["parent-span"]);
+
+      const turn = spans.find((s) => s.span_attributes?.name === "turn: t1");
+      expect(turn).toBeDefined();
+      expect(turn?.root_span_id).toBe("root-span");
+      expect(turn?.span_parents).toEqual([root.span_id]);
+    } finally {
+      trace.cleanup();
+    }
   });
 });
 
@@ -1738,6 +1783,8 @@ describe("CodexEventProcessor: config / master switch", () => {
       appUrl: undefined,
       traceToBraintrust: true,
       additionalMetadata: undefined,
+      parentSpanId: undefined,
+      rootSpanId: undefined,
     });
   });
 

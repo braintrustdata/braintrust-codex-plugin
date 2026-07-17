@@ -92,6 +92,35 @@ describe("resolveReportingConfig", () => {
     });
   });
 
+  test("reads CODEX_PARENT_SPAN_ID and CODEX_ROOT_SPAN_ID from env", () => {
+    expect(
+      resolveReportingConfig({
+        CODEX_PARENT_SPAN_ID: "parent-span",
+        CODEX_ROOT_SPAN_ID: "root-span",
+      }),
+    ).toEqual({
+      parentSpanId: "parent-span",
+      rootSpanId: "root-span",
+      traceToBraintrust: false,
+    });
+  });
+
+  test("defaults rootSpanId to parentSpanId when only parent is set", () => {
+    expect(resolveReportingConfig({ CODEX_PARENT_SPAN_ID: "span-1" })).toEqual({
+      parentSpanId: "span-1",
+      rootSpanId: "span-1",
+      traceToBraintrust: false,
+    });
+  });
+
+  test("defaults parentSpanId to rootSpanId when only root is set", () => {
+    expect(resolveReportingConfig({ CODEX_ROOT_SPAN_ID: "root-1" })).toEqual({
+      parentSpanId: "root-1",
+      rootSpanId: "root-1",
+      traceToBraintrust: false,
+    });
+  });
+
   test("falls back to BRAINTRUST_DEFAULT_PROJECT for project", () => {
     expect(resolveReportingConfig({ BRAINTRUST_DEFAULT_PROJECT: "dp" })).toEqual({
       project: "dp",

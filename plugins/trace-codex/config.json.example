@@ -6,6 +6,8 @@
   "appUrl": "https://www.braintrust.dev",
   "project": "my-codex-project",
   "additionalMetadata": { "team": "platform", "env": "dev" },
+  "parentSpanId": "",
+  "rootSpanId": "",
   "flushOnTurnEnd": false,
   "recordFile": "",
   "port": 52734,
