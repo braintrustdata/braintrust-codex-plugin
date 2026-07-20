@@ -724,7 +724,12 @@ describe("CodexEventProcessor: tool spans", () => {
                 span_attributes: { name: "exec_command", type: "tool" },
                 input: '{"cmd":"ls"}',
                 output: "file.txt",
-                metadata: { tool_name: "exec_command", call_id: "call_1", turn_id: "t1" },
+                metadata: {
+                  tool_name: "exec_command",
+                  call_id: "call_1",
+                  turn_id: "t1",
+                  tool_approval: "approved",
+                },
                 ended: true,
                 children: [],
               },
@@ -764,6 +769,7 @@ describe("CodexEventProcessor: tool spans", () => {
                 span_attributes: { name: "apply_patch", type: "tool" },
                 input: "*** Begin Patch",
                 output: "Success",
+                metadata: { tool_approval: "approved" },
                 ended: true,
               },
             ],
@@ -829,6 +835,8 @@ describe("CodexEventProcessor: tool spans", () => {
               {
                 span_attributes: { name: "exec_command", type: "tool" },
                 input: "{}",
+                metadata: { tool_approval: "approved" },
+                error: "Tool output missing before turn ended",
                 ended: true,
                 children: [],
               },
@@ -1141,8 +1149,9 @@ describe("CodexEventProcessor: permissions", () => {
               {
                 // The failed sandboxed attempt: no permission annotation.
                 span_attributes: { name: "exec_command", type: "tool" },
-                metadata: { call_id: "attempt", permission: undefined },
+                metadata: { call_id: "attempt", permission: undefined, tool_approval: "approved" },
                 output: "Error: network blocked",
+                error: "Error: network blocked",
                 ended: true,
               },
               {
@@ -1154,6 +1163,7 @@ describe("CodexEventProcessor: permissions", () => {
                     sandbox_permissions: "require_escalated",
                     justification: "Need network access",
                   },
+                  tool_approval: "approved",
                 },
                 tags: ["permission-request"],
                 output: "ok",

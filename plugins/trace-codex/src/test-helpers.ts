@@ -103,6 +103,7 @@ export interface CapturedSpan {
   span_attributes?: { name?: string; type?: string };
   input?: unknown;
   output?: unknown;
+  error?: unknown;
   metadata?: Record<string, unknown>;
   tags?: string[];
   metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
@@ -158,6 +159,7 @@ export interface SpanTree {
   type?: string;
   input?: unknown;
   output?: unknown;
+  error?: unknown;
   metadata?: Record<string, unknown>;
   tags?: string[];
   metrics?: { start?: number; end?: number } & Record<string, number | undefined>;
@@ -237,6 +239,7 @@ export function spansToTree(rawSpans: CapturedSpan[]): SpanTree | null {
       type: span.span_attributes?.type,
       input: span.input,
       output: span.output,
+      error: span.error,
       metadata: span.metadata,
       tags: span.tags,
       metrics: span.metrics,
@@ -255,6 +258,7 @@ export interface ExpectedSpan {
   span_attributes?: { name?: string | RegExp; type?: string };
   input?: unknown;
   output?: unknown;
+  error?: unknown;
   metadata?: Record<string, unknown>;
   /** If set, assert each listed tag is present on the span. */
   tags?: string[];
@@ -319,6 +323,11 @@ export function diffSpan(actual: SpanTree | null, expected: ExpectedSpan, path: 
     const a = JSON.stringify(actual.output);
     const e = JSON.stringify(expected.output);
     if (a !== e) diffs.push(`${path}.output: expected ${e}, got ${a}`);
+  }
+  if (expected.error !== undefined) {
+    const a = JSON.stringify(actual.error);
+    const e = JSON.stringify(expected.error);
+    if (a !== e) diffs.push(`${path}.error: expected ${e}, got ${a}`);
   }
   if (expected.metadata !== undefined) {
     for (const [key, value] of Object.entries(expected.metadata)) {
