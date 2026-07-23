@@ -81,6 +81,7 @@ const POST_TOOL_USE = "PostToolUse";
 const PRE_COMPACT = "PreCompact";
 const POST_COMPACT = "PostCompact";
 const SPAWN_AGENT_TOOL = "spawn_agent";
+const MISSING_TOOL_OUTPUT_ERROR = "Tool output missing before turn ended";
 // Tag applied to a tool span whose call requested escalated permissions, so
 // permission-gated actions are easy to find/filter in Braintrust.
 const PERMISSION_TAG = "permission-request";
@@ -605,6 +606,53 @@ function skillLoadMetadata(info: SkillLoadInfo | undefined): Record<string, unkn
     ...(info.skillName !== undefined ? { skill_name: info.skillName } : {}),
     ...(info.skillPath !== undefined ? { skill_path: info.skillPath } : {}),
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function conciseErrorText(value: unknown, fallback: string): string {
+  if (typeof value === "string") return value.split("\n")[0] || fallback;
+  if (value instanceof Error) return value.message || fallback;
+  if (isObject(value)) {
+    const candidate = value.error ?? value.message ?? value.stderr ?? value.output ?? value.result;
+    if (typeof candidate === "string") return candidate.split("\n")[0] || fallback;
+  }
+  return fallback;
+}
+
+function classifyToolOutput(output: unknown): { error?: string } {
+  if (isObject(output)) {
+    if (output.is_error === true || output.isError === true) {
+      return { error: conciseErrorText(output, "Tool execution failed") };
+    }
+    if (output.status === "error" || output.status === "failed") {
+      return { error: conciseErrorText(output, "Tool execution failed") };
+    }
+    if (output.error !== undefined) {
+      return {
+        error: conciseErrorText(output.error, "Tool execution failed"),
+      };
+    }
+    const exitCode = output.exit_code ?? output.exitCode;
+    if (typeof exitCode === "number" && exitCode !== 0) {
+      return {
+        error: conciseErrorText(output, `Exit code ${exitCode}`),
+      };
+    }
+  }
+
+  if (typeof output === "string") {
+    const firstLine = output.split("\n")[0] ?? output;
+    if (/^Error:/i.test(firstLine)) return { error: firstLine };
+    const exitMatch = /^Exit code\s+(-?\d+)/i.exec(firstLine);
+    if (exitMatch !== null && Number(exitMatch[1]) !== 0) {
+      return { error: firstLine };
+    }
+  }
+
+  return {};
 }
 
 // ConversationItems (chat messages / reasoning) are already plain JSON, so they
@@ -1935,8 +1983,13 @@ export class CodexEventProcessor implements EventProcessor {
       return;
     }
     const endTime = isoToUnixSeconds(record.timestamp);
+    const { error } = classifyToolOutput(output);
     try {
-      entry.span.log({ output });
+      entry.span.log({
+        output,
+        metadata: { tool_approval: "approved" },
+        ...(error !== undefined ? { error } : {}),
+      });
       entry.span.end(endTime !== undefined ? { endTime } : undefined);
       // A tool is a child of its turn; advance the turn's boundary so a following
       // LLM call (the model resuming after the tool result) starts here.
@@ -1963,6 +2016,10 @@ export class CodexEventProcessor implements EventProcessor {
     for (const [callId, entry] of scope.openTools) {
       if (entry.turnId !== turnId) continue;
       try {
+        entry.span.log({
+          metadata: { tool_approval: "approved" },
+          error: MISSING_TOOL_OUTPUT_ERROR,
+        });
         entry.span.end(endTime !== undefined ? { endTime } : undefined);
       } catch (err) {
         this.logger.error("codex processor: failed to end dangling tool span", {
@@ -1985,6 +2042,10 @@ export class CodexEventProcessor implements EventProcessor {
   ): void {
     for (const [callId, entry] of scope.openTools) {
       try {
+        entry.span.log({
+          metadata: { tool_approval: "approved" },
+          error: MISSING_TOOL_OUTPUT_ERROR,
+        });
         entry.span.end(endArgs);
       } catch (err) {
         this.logger.error("codex processor: failed to end dangling tool span", {
