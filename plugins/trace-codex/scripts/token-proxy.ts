@@ -11,7 +11,7 @@
 //
 // ── Usage ──────────────────────────────────────────────────────────────────
 //   1. Run the proxy:
-//        bun run scripts/token-proxy.ts
+//        pnpm exec tsx scripts/token-proxy.ts
 //      It listens on http://127.0.0.1:53800 and, by default, forwards to the
 //      ChatGPT backend (https://chatgpt.com) — for ChatGPT-login Codex, the
 //      common case. It logs every request it receives.
@@ -32,7 +32,7 @@
 //        wire_api = "responses"
 //
 //      For API-key login instead: run the proxy with
-//        TOKEN_PROXY_UPSTREAM=https://api.openai.com bun run scripts/token-proxy.ts
+//        TOKEN_PROXY_UPSTREAM=https://api.openai.com pnpm exec tsx scripts/token-proxy.ts
 //      and use:
 //        model_provider = "token-proxy"
 //        [model_providers.token-proxy]
@@ -57,6 +57,8 @@
 // `usage` from the parsed body) for completeness.
 
 import { appendFileSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { Readable } from "node:stream";
 
 const PORT = Number(process.env.TOKEN_PROXY_PORT || "53800");
 // Upstream ORIGIN the proxy forwards to (scheme://host, no path). The proxy is a
@@ -282,79 +284,95 @@ function makeUsageSniffer(): TransformStream<Uint8Array, Uint8Array> {
   });
 }
 
-/** Build the upstream URL: UPSTREAM + the part of the path after our `/v1`. */
-function upstreamUrl(reqUrl: string): string {
+/** Build the upstream URL: UPSTREAM + the request path + query, verbatim. */
+function upstreamUrl(reqPath: string): string {
   // Transparent tunnel: forward the exact path + query Codex built onto the
   // upstream origin. (The provider's base_url is configured so Codex builds the
-  // correct downstream path; the proxy never rewrites it.)
-  const { pathname, search } = new URL(reqUrl);
+  // correct downstream path; the proxy never rewrites it.) req.url is just the
+  // path here (Node), so parse it against a dummy base.
+  const { pathname, search } = new URL(reqPath, "http://127.0.0.1");
   return `${UPSTREAM}${pathname}${search}`;
 }
 
-const server = Bun.serve({
-  port: PORT,
-  hostname: "127.0.0.1",
-  // Generous: model calls can stream for minutes.
-  idleTimeout: 0,
-  async fetch(req) {
-    const target = upstreamUrl(req.url);
-    const path = new URL(req.url).pathname;
-    // Log every request so it's obvious when Codex is (or isn't) hitting us.
-    log(`${req.method} ${path} -> ${target}`);
+async function handleProxy(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const reqPath = req.url ?? "/";
+  const method = req.method ?? "GET";
+  const target = upstreamUrl(reqPath);
+  const path = new URL(reqPath, "http://127.0.0.1").pathname;
+  // Log every request so it's obvious when Codex is (or isn't) hitting us.
+  log(`${method} ${path} -> ${target}`);
 
-    // Forward the request verbatim (method, headers, body). Codex already set
-    // the Authorization header (ChatGPT token or API key) and the account/session
-    // headers, so we just relay them. Drop `host` so fetch derives the correct
-    // upstream host (otherwise it carries our 127.0.0.1:PORT and breaks routing).
-    const headers = new Headers(req.headers);
-    headers.delete("host");
-    let upstream: Response;
-    try {
-      upstream = await fetch(target, {
-        method: req.method,
-        headers,
-        body: req.body,
-        // `duplex: "half"` is required to stream a request body; not in the DOM
-        // RequestInit type, so widen via a cast.
-        ...({ duplex: "half" } as Record<string, unknown>),
-        redirect: "manual",
-      });
-    } catch (err) {
-      log(`upstream fetch failed for ${req.method} ${path}: ${String(err)}`);
-      return new Response(JSON.stringify({ error: "proxy_upstream_failed" }), {
-        status: 502,
-        headers: { "content-type": "application/json" },
-      });
-    }
+  // Forward the request verbatim (method, headers, body). Codex already set the
+  // Authorization header (ChatGPT token or API key) and the account/session
+  // headers, so we just relay them. Drop `host` so fetch derives the correct
+  // upstream host (otherwise it carries our 127.0.0.1:PORT and breaks routing).
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers)) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) for (const v of value) headers.append(key, v);
+    else headers.set(key, value);
+  }
+  headers.delete("host");
 
-    const contentType = upstream.headers.get("content-type") ?? "";
-    log(`  <- ${upstream.status} ${contentType || "(no content-type)"}`);
-
-    // Always tee the body through the usage sniffer. We do NOT gate on
-    // content-type: the ChatGPT backend streams SSE with no (or an unexpected)
-    // content-type header, so matching "text/event-stream" misses it. The sniffer
-    // passes bytes through unchanged and looks for usage in either SSE `data:`
-    // events or a whole-body JSON object, so it's safe for any response.
-    if (upstream.body) {
-      const teed = upstream.body.pipeThrough(makeUsageSniffer());
-      return new Response(teed, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: upstream.headers,
-      });
-    }
-
-    // No body (e.g. a HEAD or 204): pass straight through.
-    return new Response(upstream.body, {
-      status: upstream.status,
-      statusText: upstream.statusText,
-      headers: upstream.headers,
+  const hasBody = method !== "GET" && method !== "HEAD";
+  let upstream: Response;
+  try {
+    upstream = await fetch(target, {
+      method,
+      headers,
+      // Stream the request body through as a web ReadableStream.
+      body: hasBody ? (Readable.toWeb(req) as ReadableStream<Uint8Array>) : undefined,
+      // `duplex: "half"` is required to stream a request body; not in the DOM
+      // RequestInit type, so widen via a cast.
+      ...({ duplex: "half" } as Record<string, unknown>),
+      redirect: "manual",
     });
-  },
-});
+  } catch (err) {
+    log(`upstream fetch failed for ${method} ${path}: ${String(err)}`);
+    res.writeHead(502, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: "proxy_upstream_failed" }));
+    return;
+  }
 
-log(`listening on http://127.0.0.1:${server.port} -> ${UPSTREAM}`);
-log(`writing per-call usage to ${OUT}`);
+  const contentType = upstream.headers.get("content-type") ?? "";
+  log(`  <- ${upstream.status} ${contentType || "(no content-type)"}`);
+
+  // Copy upstream response headers back to the client verbatim.
+  const outHeaders: Record<string, string> = {};
+  upstream.headers.forEach((value, key) => {
+    outHeaders[key] = value;
+  });
+  res.writeHead(upstream.status, outHeaders);
+
+  // Always tee the body through the usage sniffer. We do NOT gate on
+  // content-type: the ChatGPT backend streams SSE with no (or an unexpected)
+  // content-type header, so matching "text/event-stream" misses it. The sniffer
+  // passes bytes through unchanged and looks for usage in either SSE `data:`
+  // events or a whole-body JSON object, so it's safe for any response.
+  if (upstream.body) {
+    const teed = upstream.body.pipeThrough(makeUsageSniffer());
+    Readable.fromWeb(teed as unknown as ReadableStream<Uint8Array>).pipe(res);
+    return;
+  }
+
+  // No body (e.g. a HEAD or 204): nothing to stream.
+  res.end();
+}
+
+const server = createServer((req, res) => {
+  void handleProxy(req, res);
+});
+// Generous: model calls can stream for minutes; disable the request/socket
+// timeouts so a long stream isn't torn down mid-flight.
+server.requestTimeout = 0;
+server.timeout = 0;
+
+server.listen(PORT, "127.0.0.1", () => {
+  const addr = server.address();
+  const boundPort = typeof addr === "object" && addr !== null ? addr.port : PORT;
+  log(`listening on http://127.0.0.1:${boundPort} -> ${UPSTREAM}`);
+  log(`writing per-call usage to ${OUT}`);
+});
 
 function summarize(): void {
   log(
@@ -364,7 +382,7 @@ function summarize(): void {
       `total=${sessionTotal.total_tokens}`,
   );
   record({ kind: "session_total", calls: callCount, sessionTotal: { ...sessionTotal } });
-  server.stop(true);
+  server.close();
   process.exit(0);
 }
 

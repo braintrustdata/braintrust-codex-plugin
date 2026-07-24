@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import type { SpanFactory, SpanFactoryProvider } from "../braintrust/logger.ts";
 import type { Logger } from "../log.ts";
 import type { EnqueueEvent } from "../server/routes.ts";

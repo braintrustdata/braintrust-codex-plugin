@@ -1,8 +1,8 @@
-import { afterEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterEach, describe, expect, test } from "vitest";
 import type { ReportingConfig, SpanFactory } from "../../braintrust/logger.ts";
 import type { EnqueueEvent } from "../../server/routes.ts";
 import {

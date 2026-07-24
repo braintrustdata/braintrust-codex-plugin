@@ -12,7 +12,7 @@
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
-    "types": ["bun-types"]
+    "types": ["node"]
   },
   "include": ["src/**/*", "scripts/**/*"],
   "exclude": ["node_modules", "bin"]

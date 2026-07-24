@@ -1,9 +1,10 @@
 // Spawn the background server by re-executing this binary with "serve".
 //
-// In a Bun-compiled standalone binary, process.execPath is the binary itself,
+// In a compiled standalone binary (pkg), process.execPath is the binary itself,
 // so re-exec'ing it with "serve" runs the server entrypoint. We detach and
 // unref the child so it outlives this short-lived hook process.
 
+import { spawn } from "node:child_process";
 import { openSync } from "node:fs";
 import { join } from "node:path";
 import type { Config } from "../config.ts";
@@ -18,16 +19,26 @@ export function spawnServer(config: Config, logger: Logger): void {
     logFd = "ignore";
   }
 
+  // Re-invoke the packaged app (not "node <script>"). pkg's child_process patch,
+  // when it sees us spawn process.execPath, sets PKG_EXECPATH === the exec path
+  // unless we pre-set it — which puts the child in node-compatibility mode and
+  // makes it try to run "serve" as a script file (MODULE_NOT_FOUND). Pre-setting
+  // PKG_EXECPATH to any value other than the exec path (and not the
+  // "PKG_INVOKE_NODEJS" sentinel) makes pkg's bootstrap boot the packaged app
+  // instead, with "serve" preserved as the mode argument. See @yao-pkg/pkg
+  // prelude bootstrap.js (entrypoint selection) and bootstrap-shared.js (the
+  // "already defined -> don't override" guard).
+  const env = { ...process.env, PKG_EXECPATH: "codex-hook-child" };
+
   try {
-    const child = Bun.spawn([process.execPath, "serve"], {
-      // Inherit env so BRAINTRUST_EVENT_SERVER_* / PLUGIN_DATA carry over.
-      env: process.env,
-      stdin: "ignore",
-      stdout: logFd,
-      stderr: logFd,
+    const child = spawn(process.execPath, ["serve"], {
+      env,
+      // stdin ignored; stdout/stderr to the logfile (or ignored if unopened).
+      stdio: ["ignore", logFd, logFd],
       // Detach so the server is not tied to this hook process's lifetime.
-      // Bun keeps children unref'd by default; unref() is explicit and safe.
+      detached: true,
     });
+    // Don't let the parent's event loop wait on the child.
     child.unref();
     logger.info("spawned server", { pid: child.pid, port: config.port });
   } catch (err) {
