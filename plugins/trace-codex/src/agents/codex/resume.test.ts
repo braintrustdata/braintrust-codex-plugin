@@ -7,7 +7,7 @@
 // same result as if one processor had handled the whole session — instead of
 // duplicating or orphaning spans.
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import type { SpanFactory } from "../../braintrust/logger.ts";
 import {
   type CapturedSpan,

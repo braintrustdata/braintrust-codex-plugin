@@ -5,13 +5,13 @@
 #                      integration check.
 #   make lint          Run the Biome linter/formatter check (no writes).
 #   make typecheck     Run the TypeScript type checker.
-#   make unit          Run only the bun unit tests.
+#   make unit          Run only the unit tests (vitest).
 #   make build         Compile the host binary (and per-platform binaries).
 #   make integration   Build, boot the server via the hook binary, health-check,
 #                      assert the version, then shut it down.
 #   make smoke         End-to-end: run a real `codex exec` session with the
 #                      installed plugin, traced to a local mock collector, and
-#                      assert >=1 trace row. Requires codex, bun, and
+#                      assert >=1 trace row. Requires codex, node, pnpm, and
 #                      OPENAI_API_KEY; optionally SMOKE_VERSION to pin a release.
 #   make token-proxy   Run the token-counting proxy (debugging aid) that sits
 #                      between Codex and OpenAI and prints each call's token usage
@@ -38,19 +38,19 @@ test: lint typecheck unit integration
 
 lint:
 	@echo "==> Linting (biome)"
-	bun run check
+	pnpm run check
 
 typecheck:
 	@echo "==> Typechecking (tsc)"
-	bun run typecheck
+	pnpm run typecheck
 
 unit:
 	@echo "==> Running unit tests"
-	bun test
+	pnpm test
 
 build:
 	@echo "==> Building binaries"
-	BUILD_HOST_ONLY=1 bun run build
+	BUILD_HOST_ONLY=1 pnpm run build
 
 integration: build
 	@echo "==> Integration test (port $(TEST_PORT), expecting version $(EXPECTED_VERSION))"
@@ -101,7 +101,7 @@ smoke:
 # point Codex at it via a custom model_provider (see scripts/token-proxy.ts).
 token-proxy:
 	@echo "==> Token proxy (Ctrl-C for the session total)"
-	bun run scripts/token-proxy.ts
+	pnpm exec tsx scripts/token-proxy.ts
 
 clean:
 	@echo "==> Cleaning"

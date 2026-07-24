@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { LruMap } from "./lru-map.ts";
 
 describe("LruMap", () => {

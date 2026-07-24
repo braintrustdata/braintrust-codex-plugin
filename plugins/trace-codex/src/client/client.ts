@@ -24,8 +24,14 @@ export type EventBuilder = (rawStdin: string, env?: NodeJS.ProcessEnv) => Enqueu
 
 /** Read all of stdin as a string. */
 async function readStdin(): Promise<string> {
+  // No piped input (e.g. an interactive TTY): don't block waiting for EOF.
+  if (process.stdin.isTTY) return "";
   try {
-    return await Bun.stdin.text();
+    const chunks: Buffer[] = [];
+    for await (const chunk of process.stdin) {
+      chunks.push(chunk as Buffer);
+    }
+    return Buffer.concat(chunks).toString("utf8");
   } catch {
     return "";
   }

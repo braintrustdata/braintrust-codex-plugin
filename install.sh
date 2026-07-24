@@ -78,7 +78,7 @@ read_json_field() {
   grep -o "\"$2\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$1" | head -1 | sed 's/.*"\([^"]*\)"$/\1/'
 }
 
-# Build a plugin's compiled assets if it has a Bun build (build-on-install).
+# Build a plugin's compiled assets if it has a build (build-on-install).
 build_plugin() {
   plugin_src="$1"
   if [ ! -f "$plugin_src/package.json" ]; then
@@ -87,13 +87,13 @@ build_plugin() {
   if ! grep -q '"build"' "$plugin_src/package.json"; then
     return 0
   fi
-  if ! command -v bun >/dev/null 2>&1; then
-    echo "Error: '$folder' needs Bun to build, but 'bun' was not found." >&2
-    echo "       Install Bun from https://bun.sh and re-run ./install.sh" >&2
+  if ! command -v pnpm >/dev/null 2>&1; then
+    echo "Error: '$folder' needs pnpm to build, but 'pnpm' was not found." >&2
+    echo "       Install pnpm from https://pnpm.io/installation and re-run ./install.sh" >&2
     exit 1
   fi
-  echo "  building (bun)..."
-  ( cd "$plugin_src" && bun install --silent && BUILD_HOST_ONLY=1 bun run build )
+  echo "  building (pnpm)..."
+  ( cd "$plugin_src" && pnpm install --reporter=silent && BUILD_HOST_ONLY=1 pnpm run build )
 }
 
 for folder in "${PLUGINS[@]}"; do
