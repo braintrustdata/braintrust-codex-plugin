@@ -7,10 +7,26 @@ A [Codex plugin](https://developers.openai.com/codex/plugins) that wires Codex l
 ```bash
 codex plugin marketplace add braintrustdata/braintrust-codex-plugin
 codex plugin add trace-codex@braintrust-codex-plugins
+```
+
+Create an API key in Braintrust under **Settings > API keys**. The key must be available in the environment where Codex runs. Either export it in your current shell before starting Codex:
+
+```bash
+export BRAINTRUST_API_KEY="<your-braintrust-api-key>"
 # NOTE: tracing must be explicitly enabled
 # upon first run, codex will prompt for plugin permissions
 TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
-# to upgrade:
+```
+
+Or set it for only that Codex invocation:
+
+```bash
+BRAINTRUST_API_KEY="<your-braintrust-api-key>" TRACE_TO_BRAINTRUST=true BRAINTRUST_PROJECT=my-coding-agent codex
+```
+
+To upgrade:
+
+```bash
 codex plugin marketplace upgrade braintrust-codex-plugins
 ```
 
