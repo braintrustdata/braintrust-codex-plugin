@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { createTestLogger } from "../test-helpers.ts";
 import { EventQueue } from "./event-queue.ts";
 import { handleRequest, type RouteDeps } from "./routes.ts";

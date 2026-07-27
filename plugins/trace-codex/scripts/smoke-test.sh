@@ -17,7 +17,8 @@
 #     CODEX_API_KEY from OPENAI_API_KEY below).
 #   - The trace-codex plugin is installed and enabled in Codex (the CI workflow
 #     installs it from the published release; locally use ./install.sh).
-#   - Bun is on PATH (used to run the mock collector).
+#   - node + pnpm are on PATH (used to run the mock collector via tsx), and the
+#     plugin's dependencies are installed (`pnpm install` in the plugin dir).
 #   - OPENAI_API_KEY is set.
 #   - For a private release repo, GH_TOKEN or GITHUB_TOKEN (or an authenticated
 #     `gh`) so the launcher can download the binary.
@@ -55,7 +56,7 @@ scrub() {
 
 [ -n "${OPENAI_API_KEY:-}" ] || fail "OPENAI_API_KEY is not set"
 command -v codex >/dev/null 2>&1 || fail "codex is not on PATH"
-command -v bun >/dev/null 2>&1 || fail "bun is not on PATH"
+command -v pnpm >/dev/null 2>&1 || fail "pnpm is not on PATH"
 
 # Belt-and-suspenders: explicitly mask the key in GitHub Actions logs. This
 # covers any reformatted appearance beyond GitHub's automatic secret masking.
@@ -88,7 +89,7 @@ trap cleanup EXIT INT TERM
 
 log "starting mock collector on $BASE_URL"
 MOCK_COLLECTOR_PORT="$PORT" MOCK_COLLECTOR_OUT="$SUMMARY" \
-  bun run "$PLUGIN_DIR/scripts/mock-collector.ts" >"$COLLECTOR_LOG" 2>&1 &
+  pnpm --dir "$PLUGIN_DIR" exec tsx scripts/mock-collector.ts >"$COLLECTOR_LOG" 2>&1 &
 COLLECTOR_PID=$!
 
 # Wait for it to accept connections.

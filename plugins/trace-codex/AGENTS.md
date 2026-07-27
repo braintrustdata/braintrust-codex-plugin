@@ -63,16 +63,28 @@ Keep this boundary clean: nothing under `src/server/`, `src/processor/`, or
 eventually be extracted into its own package, so treat any Codex-specific leak
 into the generic layers as a bug, not a shortcut.
 
-### 2. Bun-compiled, cross-platform binaries
+### 2. Node-compiled, cross-platform binaries
 
 The hook command in `hooks.json` is a fixed, platform-agnostic string that
 invokes `bin/codex-hook.sh` (or `.cmd` on Windows), **not** the binary directly.
 That launcher resolves and runs the real, platform-specific `codex-hook` binary.
 
-- `scripts/build.ts` compiles `src/index.ts` with `bun build --compile` for each
-  target (`darwin-arm64/x64`, `linux-x64/arm64`; Windows slots in but isn't
-  built yet). `BUILD_HOST_ONLY=1` builds just the host target (used by the
-  repo-root `install.sh` for local dev installs).
+- `scripts/build.ts` runs a two-step build: `tsup` bundles `src/index.ts` into a
+  single self-contained CommonJS file (`dist/codex-hook.cjs`, inlining the
+  `braintrust` dependency), then `@yao-pkg/pkg` wraps that bundle plus a Node
+  runtime into a standalone executable per target (`darwin-arm64/x64`,
+  `linux-x64/arm64`; Windows slots in but isn't built yet). `BUILD_HOST_ONLY=1`
+  builds just the host target (used by the repo-root `install.sh` for local dev
+  installs).
+- **Build the release on macOS.** pkg code-signs the darwin binaries via the
+  `codesign` utility (macOS-only), and Apple Silicon kills an unsigned arm64
+  binary on launch. A macOS host cross-compiles the Linux targets too, so one
+  job produces all four signed/valid binaries (see `release.yaml`).
+- **Re-exec caveat (pkg):** the hook spawns the server by re-executing
+  `process.execPath` with `serve`. pkg's child_process patch would otherwise make
+  the child act like `node` and treat `serve` as a script path, so
+  `spawn-server.ts` pre-sets `PKG_EXECPATH` to a non-exec-path sentinel to force
+  packaged-app mode. See the comment there.
 - The compiled binaries are **large and not committed**. The launcher downloads
   the matching binary from the plugin's GitHub release on first use and caches
   it at `$PLUGIN_ROOT/bin/codex-hook`. Codex wipes `$PLUGIN_ROOT` on every
@@ -184,12 +196,13 @@ Invariants to preserve when changing this:
 
 Run from `plugins/trace-codex/`:
 
-- `bun test` — run the test suite (tests live next to sources as `*.test.ts`).
-- `bun run typecheck` — `tsc --noEmit`.
-- `bun run lint` / `bun run check` — Biome lint / lint+format.
-- `bun run build` — compile all target binaries (`BUILD_HOST_ONLY=1` for host
-  only).
-- `bun run dev` — run the server in watch mode.
+- `pnpm test` — run the test suite with vitest (tests live next to sources as
+  `*.test.ts`).
+- `pnpm run typecheck` — `tsc --noEmit`.
+- `pnpm run lint` / `pnpm run check` — Biome lint / lint+format.
+- `pnpm run build` — build all target binaries via tsup + pkg
+  (`BUILD_HOST_ONLY=1` for host only).
+- `pnpm run dev` — run the server in watch mode (tsx).
 
 Add or update tests alongside any behavior change; keep typecheck and lint
 clean.

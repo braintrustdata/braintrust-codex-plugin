@@ -1,0 +1,11 @@
+# pnpm settings live here (not package.json) as of pnpm 10+. This package is a
+# single project, not a multi-package workspace; the file exists only to record
+# a decision on dependency install/build scripts. pnpm 11 treats un-acknowledged
+# build scripts as a hard error, which otherwise fails `pnpm run <script>`.
+#
+# Neither of these needs its build script: esbuild ships its platform binary as
+# an optional dependency, and braintrust runs fine without its postinstall. We
+# deny both explicitly to keep installs deterministic and script-free.
+allowBuilds:
+  braintrust: false
+  esbuild: false

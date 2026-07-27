@@ -19,6 +19,7 @@
 // so the smoke test can read the result after the Codex session ends.
 
 import { writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage } from "node:http";
 
 const PORT = Number(process.env.MOCK_COLLECTOR_PORT || "53999");
 const OUT = process.env.MOCK_COLLECTOR_OUT || "";
@@ -30,11 +31,11 @@ function log(message: string): void {
   process.stderr.write(`mock-collector: ${message}\n`);
 }
 
-function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+/** Read and JSON-parse a request body. */
+async function readJson(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
 }
 
 /** Count the trace rows in a /logs3 body: { rows: [...], api_version: 2 }. */
@@ -49,52 +50,63 @@ function countRows(body: unknown): number {
   return 0;
 }
 
-const server = Bun.serve({
-  port: PORT,
-  hostname: "127.0.0.1",
-  async fetch(req) {
-    const { pathname } = new URL(req.url);
+const server = createServer((req, res) => {
+  const method = req.method ?? "GET";
+  const { pathname } = new URL(req.url ?? "/", `http://127.0.0.1:${PORT}`);
+  const send = (body: unknown, status = 200): void => {
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(JSON.stringify(body));
+  };
 
+  void (async () => {
     // Login handshake. api_url/proxy_url are echoed back, but the SDK uses
     // BRAINTRUST_API_URL (set by the smoke test) for the data plane regardless.
-    if (req.method === "POST" && pathname === "/api/apikey/login") {
+    if (method === "POST" && pathname === "/api/apikey/login") {
       const self = `http://127.0.0.1:${PORT}`;
-      return json({
+      send({
         org_info: [{ id: "smoke-org", name: "smoke", api_url: self, proxy_url: self }],
       });
+      return;
     }
 
     // Project registration -> returns a project id the rows reference.
-    if (req.method === "POST" && pathname === "/api/project/register") {
-      return json({ project: { id: "00000000-0000-0000-0000-000000000000", name: "smoke" } });
+    if (method === "POST" && pathname === "/api/project/register") {
+      send({ project: { id: "00000000-0000-0000-0000-000000000000", name: "smoke" } });
+      return;
     }
 
     // Payload-limit probe. Tolerated by the SDK; return no limit.
-    if (req.method === "GET" && pathname === "/version") {
-      return json({ logs3_payload_max_bytes: null });
+    if (method === "GET" && pathname === "/version") {
+      send({ logs3_payload_max_bytes: null });
+      return;
     }
 
     // The actual span data. Count the rows and acknowledge.
-    if (req.method === "POST" && (pathname === "/logs3" || pathname === "/logs3/overflow")) {
+    if (method === "POST" && (pathname === "/logs3" || pathname === "/logs3/overflow")) {
       let rows = 0;
       try {
-        rows = countRows(await req.json());
+        rows = countRows(await readJson(req));
       } catch (err) {
         log(`failed to parse ${pathname} body: ${String(err)}`);
       }
       logs3Requests += 1;
       totalRows += rows;
       log(`received ${pathname}: ${rows} row(s) (total ${totalRows})`);
-      return json({});
+      send({});
+      return;
     }
 
     // Anything else: 200 with an empty object so the SDK never hard-fails.
-    log(`unhandled ${req.method} ${pathname}`);
-    return json({});
-  },
+    log(`unhandled ${method} ${pathname}`);
+    send({});
+  })();
 });
 
-log(`listening on http://127.0.0.1:${server.port}`);
+server.listen(PORT, "127.0.0.1", () => {
+  const addr = server.address();
+  const boundPort = typeof addr === "object" && addr !== null ? addr.port : PORT;
+  log(`listening on http://127.0.0.1:${boundPort}`);
+});
 
 function writeSummaryAndExit(): void {
   const summary = { logs3Requests, totalRows };
@@ -108,7 +120,7 @@ function writeSummaryAndExit(): void {
   } else {
     log(`summary: ${JSON.stringify(summary)}`);
   }
-  server.stop(true);
+  server.close();
   process.exit(0);
 }
 

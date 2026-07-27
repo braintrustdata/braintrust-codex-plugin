@@ -104,7 +104,11 @@ jobs:
   # Phase 2: publish once the version bump lands on main via the merged PR.
   publish:
     if: github.event_name == 'push'
-    runs-on: ubuntu-24.04
+    # Build on macOS: pkg code-signs the darwin binaries via the `codesign`
+    # utility (which only exists on macOS), and an unsigned arm64 binary is
+    # killed on launch by Apple Silicon. A macOS host cross-compiles the Linux
+    # targets too, so one job still produces all four binaries.
+    runs-on: macos-15
     outputs:
       version: ${{ steps.vars.outputs.version }}
       published: ${{ steps.vars.outputs.published }}
@@ -134,19 +138,27 @@ jobs:
             echo "published=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Bun
+      - name: Install pnpm
         if: steps.vars.outputs.published == 'true'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        uses: pnpm/action-setup@a7487c7e89a18df4991f7f222e4898a00d66ddda # v4
         with:
-          bun-version: latest
+          version: 11
+
+      - name: Install Node.js
+        if: steps.vars.outputs.published == 'true'
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ${{ env.PLUGIN_DIR }}/pnpm-lock.yaml
 
       - name: Build release binaries
         if: steps.vars.outputs.published == 'true'
         working-directory: ${{ env.PLUGIN_DIR }}
         run: |
-          bun install --frozen-lockfile
+          pnpm install --frozen-lockfile
           # Cross-compiles every target (darwin/linux x arm64/x64) into bin/.
-          bun run build
+          pnpm run build
           ls -la bin/
 
       - name: Create and push tag

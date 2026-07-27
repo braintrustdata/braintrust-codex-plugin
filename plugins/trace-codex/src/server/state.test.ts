@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { ServerState } from "./state.ts";
 
 // Version is incidental to these tests (they exercise heartbeat/shutdown), so

@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { EventRecorder } from "../server/recorder.ts";
 import type { EnqueueEvent } from "../server/routes.ts";
 import { createTestLogger } from "../test-helpers.ts";

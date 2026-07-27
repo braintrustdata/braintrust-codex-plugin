@@ -3,6 +3,7 @@
 // exercises the full real pipeline (queue -> registry -> processors -> spans),
 // reproducing the original session's trace.
 
+import { readFile } from "node:fs/promises";
 import { checkHealth, ensureServer, sleep } from "../client/ensure-server.ts";
 import { spawnServer } from "../client/spawn-server.ts";
 import type { Config } from "../config.ts";
@@ -46,7 +47,7 @@ export async function runReplay(
 ): Promise<ReplayResult> {
   let text: string;
   try {
-    text = await Bun.file(filePath).text();
+    text = await readFile(filePath, "utf8");
   } catch (err) {
     logger.error("replay: could not read recording file", {
       filePath,

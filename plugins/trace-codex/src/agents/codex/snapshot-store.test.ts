@@ -1,7 +1,7 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { createTestLogger } from "../../test-helpers.ts";
 import { SnapshotStore } from "./snapshot-store.ts";
 import type { CodexSnapshot } from "./state-snapshot.ts";

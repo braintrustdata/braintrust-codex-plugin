@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import type { Config } from "../config.ts";
 import type { EventProcessorFactory } from "../processor/event-processor.ts";
 import { createTestLogger } from "../test-helpers.ts";
@@ -22,6 +22,7 @@ function testConfig(overrides: Partial<Config> = {}): Config {
 describe("startServer", () => {
   test("serves /health and stops via stop()", async () => {
     const server = startServer(testConfig(), new Map(), createTestLogger());
+    await server.ready;
     try {
       const res = await fetch(`http://127.0.0.1:${server.port}/health`);
       expect(res.status).toBe(200);
@@ -38,6 +39,7 @@ describe("startServer", () => {
       new Map(),
       createTestLogger(),
     );
+    await server.ready;
 
     // Wait for the watchdog to fire and stop the server.
     const stoppedInTime = await Promise.race([
@@ -65,6 +67,7 @@ describe("startServer", () => {
       new Map(),
       createTestLogger(),
     );
+    await server.ready;
 
     try {
       // Keep it alive past the idle window by pinging /health repeatedly.
@@ -98,6 +101,7 @@ describe("startServer", () => {
       new Map([["test", factory]]),
       createTestLogger(),
     );
+    await server.ready;
 
     try {
       // Enqueue a backlog whose total processing time (~240ms) far exceeds the
@@ -148,6 +152,7 @@ describe("startServer", () => {
       new Map([["test", factory]]),
       createTestLogger(),
     );
+    await server.ready;
 
     try {
       const enqueue = await fetch(`http://127.0.0.1:${server.port}/enqueue`, {

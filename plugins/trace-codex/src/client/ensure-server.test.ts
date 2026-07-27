@@ -1,4 +1,4 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, test, vi } from "vitest";
 import type { Config } from "../config.ts";
 import { createTestLogger } from "../test-helpers.ts";
 import { type EnsureServerDeps, ensureServer, type HealthStatus } from "./ensure-server.ts";
@@ -21,15 +21,15 @@ const fastTimings = {
 /** Build deps where checkHealth returns a scripted sequence of statuses. */
 function makeDeps(statuses: HealthStatus[]): {
   deps: EnsureServerDeps;
-  spawn: ReturnType<typeof mock>;
+  spawn: ReturnType<typeof vi.fn>;
 } {
   let i = 0;
-  const checkHealth = mock(async (): Promise<HealthStatus> => {
+  const checkHealth = vi.fn(async (): Promise<HealthStatus> => {
     const s = statuses[Math.min(i, statuses.length - 1)];
     i++;
     return s;
   });
-  const spawn = mock(() => {});
+  const spawn = vi.fn(() => {});
   return {
     spawn,
     deps: {
