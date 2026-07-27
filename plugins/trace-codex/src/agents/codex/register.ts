@@ -28,7 +28,7 @@ export interface Agent {
   terminalEvents: string[];
   /**
    * Read this agent's user settings and apply them to the environment
-   * (environment wins). Returns the names of applied settings, for diagnostics
+   * (the config file wins). Returns the names of applied settings, for diagnostics
    * (never values). Run before booting the server so the client and server
    * agree on configuration.
    */

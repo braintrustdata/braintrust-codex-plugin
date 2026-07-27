@@ -179,8 +179,8 @@ Invariants to preserve when changing this:
   keep the server/processor/braintrust layers agent-agnostic.
 - **Config**: two layers. The agent-specific layer (`src/agents/codex/settings.ts`)
   reads the user's `config.json` from `PLUGIN_DATA`, maps its friendly camelCase
-  keys onto `BRAINTRUST_*` / `BRAINTRUST_EVENT_SERVER_*` env vars (env wins over
-  the file), and is run by the hook client before it boots the server — so the
+  keys onto `BRAINTRUST_*` / `BRAINTRUST_EVENT_SERVER_*` env vars (the file wins
+  over env), and is run by the hook client before it boots the server — so the
   spawned server inherits the resolved env. The generic layer (`src/config.ts`)
   then reads **only** those env vars and never touches `config.json`. Keep it
   that way: config-file parsing is deliberately agent-specific. User-facing

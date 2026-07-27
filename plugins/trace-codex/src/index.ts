@@ -57,7 +57,7 @@ async function main(): Promise<void> {
 
   // Default: hook client. The hook is the client-side entry point, so this is
   // where the agent reads its user settings and maps them onto the environment
-  // (environment wins). We do this BEFORE loadConfig so the client and the
+  // (the config file wins). We do this BEFORE loadConfig so the client and the
   // server it may spawn agree on port/etc. The spawned server inherits this
   // resolved env. Swallow everything; never break the agent's turn.
   const agent = codexAgent;

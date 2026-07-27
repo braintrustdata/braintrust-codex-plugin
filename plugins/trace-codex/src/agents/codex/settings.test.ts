@@ -115,9 +115,18 @@ describe("applySettingsToEnv", () => {
     expect(applied.sort()).toEqual(["apiKey", "port", "project"]);
   });
 
-  test("environment wins: does not overwrite an existing env var", () => {
+  test("file wins: overwrites an existing env var", () => {
     const env: NodeJS.ProcessEnv = { BRAINTRUST_PROJECT: "from-env" };
     const applied = applySettingsToEnv({ project: "from-file", apiKey: "sk" }, env);
+
+    expect(env.BRAINTRUST_PROJECT).toBe("from-file");
+    expect(env.BRAINTRUST_API_KEY).toBe("sk");
+    expect(applied.sort()).toEqual(["apiKey", "project"]);
+  });
+
+  test("env var survives for a setting the file omits", () => {
+    const env: NodeJS.ProcessEnv = { BRAINTRUST_PROJECT: "from-env" };
+    const applied = applySettingsToEnv({ apiKey: "sk" }, env);
 
     expect(env.BRAINTRUST_PROJECT).toBe("from-env");
     expect(env.BRAINTRUST_API_KEY).toBe("sk");

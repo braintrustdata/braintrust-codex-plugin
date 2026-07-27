@@ -6,9 +6,10 @@
 // onto the BRAINTRUST_* / BRAINTRUST_EVENT_SERVER_* environment variables that
 // the rest of the code (and the Braintrust SDK) already understand.
 //
-// Precedence: environment variables always win over the file, so power users
-// and CI can override the file without editing it. The file is optional;
-// missing or malformed files are ignored (never throw).
+// Precedence: the file always wins over environment variables, so a setting
+// written to config.json takes effect even when an ambient env var is present.
+// Env vars only supply a value for settings the file leaves unset. The file is
+// optional; missing or malformed files are ignored (never throw).
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -134,8 +135,9 @@ export function loadSettingsFile(path: string): Settings {
 }
 
 /**
- * Apply settings to the environment: for each setting, set its env var only if
- * that var is not already set (environment wins). Mutates `env`. Returns the
+ * Apply settings to the environment: for each setting present in the file,
+ * overwrite its env var so the file wins over any ambient value. Settings the
+ * file omits leave the existing env var untouched. Mutates `env`. Returns the
  * list of setting keys that were applied, for diagnostics (never includes
  * values, so secrets are not logged).
  */
@@ -148,7 +150,7 @@ export function applySettingsToEnv(
     const value = settings[key];
     if (value === undefined) continue;
     const envVar = SETTINGS_TO_ENV[key];
-    if (env[envVar]) continue; // environment wins
+    // The file wins: always overwrite, even when the env var is already set.
     // Objects (additionalMetadata) are serialized as JSON; everything else
     // stringifies directly (booleans -> "true"/"false", numbers, strings).
     env[envVar] = typeof value === "object" ? JSON.stringify(value) : String(value);

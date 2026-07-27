@@ -83,7 +83,7 @@ cp ~/.codex/plugins/cache/braintrust-codex-plugins/trace-codex/<plugin-version>/
 # now edit config.json with your desired settings
 ```
 
-Every setting can be provided as a `config.json` key or as an environment variable; **an environment variable always overrides config.json**
+Every setting can be provided as a `config.json` key or as an environment variable; **`config.json` always overrides the environment variable**. An environment variable only takes effect for settings that `config.json` leaves unset.
 
 | `config.json` key    | Environment variable                  | Default            | Meaning                                                                                                                                      |
 |----------------------|---------------------------------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
