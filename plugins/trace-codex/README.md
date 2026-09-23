@@ -7,11 +7,11 @@ tracing daemon through:
 bt trace hook --source codex
 ```
 
-The plugin is intentionally a thin, fail-open adapter. Its launcher installs
-the `bt` CLI with the official installer when it is not already available, then
-forwards the event. The `bt` CLI owns authentication, configuration, event
-journaling, trace construction, and delivery to Braintrust. No credentials are
-stored in the plugin.
+The plugin invokes the installed `bt` CLI directly for each hook. Install `bt`
+before enabling the plugin; it owns authentication, configuration, event
+journaling, trace construction, and delivery to Braintrust. It discovers the
+installed plugin and Codex versions dynamically. No credentials are stored in
+the plugin.
 
 ## Setup
 
@@ -25,16 +25,15 @@ Use `--profile` or `--org` when needed. Restart Codex after setup so it loads
 the plugin. Codex will apply its normal hook-review flow; approve the stable
 Braintrust hook definition through `/hooks` when prompted.
 
-To verify the daemon path is available:
+To inspect tracing configuration and daemon status:
 
 ```bash
-bt trace hook --help
+bt trace doctor codex
 bt trace status
 ```
 
-Hook setup or forwarding never fails a Codex turn. If installation fails or the
-daemon cannot accept an event, the launcher reports a bounded diagnostic and
-exits successfully.
+Hook setup or forwarding never fails a Codex turn. If the CLI is unavailable or
+the daemon cannot accept an event, Codex reports the hook failure and continues.
 
 ## Additional root metadata
 
@@ -46,3 +45,17 @@ For one invocation without changing the persistent configuration, use
 `bt trace run --additional-metadata '{"ci":true,"run_id":"abc-123"}' codex`,
 or set `BRAINTRUST_ADDITIONAL_METADATA` before that command (`bt trace run`
 still accepts it; a launched `codex` session's live hooks do not).
+
+## Tags and diagnostics
+
+Use repeatable `--tag` flags for filterable root-span tags. Inspect the effective
+configuration with `doctor` and delivery state with `status`:
+
+```bash
+bt trace enable codex --tag coding-agent --tag development
+bt trace doctor codex
+bt trace status
+```
+
+See the [distribution guide](../../README.md) for installation, one-off runs,
+transcript import, updates, and disablement.

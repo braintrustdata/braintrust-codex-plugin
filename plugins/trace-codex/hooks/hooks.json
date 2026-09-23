@@ -5,8 +5,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -17,8 +17,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -29,8 +29,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -41,8 +41,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -53,8 +53,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -65,8 +65,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -77,8 +77,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -89,8 +89,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -101,8 +101,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
@@ -113,8 +113,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash \"${PLUGIN_ROOT}/bin/codex-hook.sh\"",
-            "commandWindows": "bash \"${PLUGIN_ROOT}\\bin\\codex-hook.sh\"",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
             "statusMessage": "Braintrust tracing"
           }
         ]
