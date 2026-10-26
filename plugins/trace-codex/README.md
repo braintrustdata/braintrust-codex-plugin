@@ -13,6 +13,25 @@ journaling, trace construction, and delivery to Braintrust. It discovers the
 installed plugin and Codex versions dynamically. No credentials are stored in
 the plugin.
 
+### Selecting the CLI executable
+
+Hooks resolve `bt` from the Codex process's PATH. With version managers such as
+mise, that can select a different version depending on the working directory.
+Set `BRAINTRUST_BT_BIN` to the absolute path of the actual CLI executable to
+delegate hook capture to a fixed version:
+
+```bash
+export BRAINTRUST_BT_BIN="/absolute/path/to/bt"
+codex
+```
+
+Codex must inherit this variable; GUI launches may need separate environment
+configuration. Point it at an executable rather than a version-manager shim.
+The PATH-resolved `bt` must also be upgraded to a release supporting delegation:
+older releases cannot honor this setting (versions before 0.16 lack `trace`
+entirely). A missing or invalid target reports an error instead of silently
+falling back. The marketplace hook definition stays unchanged.
+
 ## Setup
 
 Install and configure the published plugin with the Braintrust CLI:
@@ -21,9 +40,13 @@ Install and configure the published plugin with the Braintrust CLI:
 bt trace enable codex --project my-coding-agent
 ```
 
-Use `--profile` or `--org` when needed. Restart Codex after setup so it loads
-the plugin. Codex will apply its normal hook-review flow; approve the stable
-Braintrust hook definition through `/hooks` when prompted.
+Use `--profile` or `--org` when needed. Setup activates Braintrust tracing in
+Codex. Restart Codex after setup so it loads the plugin. `bt trace update codex`
+refreshes the plugin and reapplies its setup.
+
+If setup reports an error, update Codex and `bt`, then retry. Use
+`bt trace doctor codex` to inspect route, authentication, daemon, and plugin
+diagnostics.
 
 To inspect tracing configuration and daemon status:
 

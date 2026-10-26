@@ -119,6 +119,30 @@
           }
         ]
       }
+    ],
+    "Interrupt": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bt trace hook --source codex",
+            "commandWindows": "bt trace hook --source codex",
+            "statusMessage": "Braintrust tracing"
+          }
+        ]
+      }
     ]
   }
 }
