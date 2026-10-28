@@ -9,8 +9,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKETPLACE="braintrust-codex-plugins"
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-CACHE_DIR="$CODEX_HOME/plugins/cache/$MARKETPLACE"
+CACHE_DIR="${CODEX_HOME:-$HOME/.codex}/plugins/cache/$MARKETPLACE"
 
 if ! command -v codex >/dev/null 2>&1; then
   echo "Error: 'codex' CLI not found." >&2
@@ -21,6 +20,9 @@ echo "Uninstalling Braintrust Codex plugins..."
 
 for d in "$REPO_ROOT"/plugins/*/; do
   manifest="$d/.codex-plugin/plugin.json"
+  if [ -f "$d/plugin.json" ]; then
+    manifest="$d/plugin.json"
+  fi
   [ -f "$manifest" ] || continue
   # Installable name is the manifest `name`, which may differ from the folder.
   name="$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$manifest" | head -1 | sed 's/.*"\([^"]*\)"$/\1/')"

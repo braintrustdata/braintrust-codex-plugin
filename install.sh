@@ -17,7 +17,8 @@
 #      correct config entries.
 #
 # Usage:
-#   ./install.sh                            # install all plugins in this repo
+#   ./install.sh                            # install tracing (legacy default)
+#   ./install.sh braintrust                 # install only the hosted MCP plugin
 #   ./install.sh trace-codex                # install just one plugin (by folder)
 #
 # Use ./uninstall.sh to remove.
@@ -28,14 +29,11 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MARKETPLACE="braintrust-codex-plugins"
 
-# Plugin folders to install. Default: every folder under plugins/.
+# Keep the existing tracing-only default. MCP is selected explicitly.
 if [ "$#" -gt 0 ]; then
   PLUGINS=("$@")
 else
-  PLUGINS=()
-  for d in "$REPO_ROOT"/plugins/*/; do
-    PLUGINS+=("$(basename "$d")")
-  done
+  PLUGINS=("trace-codex")
 fi
 
 if ! command -v codex >/dev/null 2>&1; then
@@ -80,6 +78,9 @@ build_plugin() {
 for folder in "${PLUGINS[@]}"; do
   plugin_src="$REPO_ROOT/plugins/$folder"
   manifest="$plugin_src/.codex-plugin/plugin.json"
+  if [ -f "$plugin_src/plugin.json" ]; then
+    manifest="$plugin_src/plugin.json"
+  fi
 
   if [ ! -f "$manifest" ]; then
     echo "Skipping '$folder': no manifest at $manifest" >&2
@@ -108,7 +109,7 @@ done
 echo ""
 echo "Done. Next steps:"
 echo "  1. Restart Codex (or start a new session) so it loads the plugins."
-echo "  2. Plugin hooks are non-managed: run /hooks in the Codex CLI and trust them"
-echo "     before they will fire."
+echo "  2. For Braintrust MCP, complete OAuth sign-in in the client."
+echo "     For tracing, run /hooks and trust the tracing hooks before they fire."
 echo ""
 echo "After editing plugin files, re-run ./install.sh to re-sync the cached copy."

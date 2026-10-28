@@ -5,6 +5,18 @@
   },
   "plugins": [
     {
+      "name": "braintrust",
+      "source": {
+        "source": "local",
+        "path": "./plugins/braintrust"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    },
+    {
       "name": "trace-codex",
       "source": {
         "source": "local",

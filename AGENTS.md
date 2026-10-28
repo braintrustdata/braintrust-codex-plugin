@@ -4,26 +4,39 @@ Guidelines for AI agents working in this repo.
 
 ## Repo purpose
 
-This repo distributes one [Codex marketplace plugin](https://developers.openai.com/codex/plugins):
+This generated repo distributes two independently opt-in
+[Codex marketplace plugins](https://developers.openai.com/plugins/build/plugins):
+
+- `plugins/braintrust/` — hosted MCP with OAuth DCR, portable root `plugin.json`
+  and `mcp.json`. No hooks, apps, skills, credentials, or local runtime.
 
 - `plugins/trace-codex/` — an opt-in plugin that traces Codex sessions to Braintrust (session, turn, and tool spans) via Codex lifecycle hooks.
 
-The plugin is listed in `.agents/plugins/marketplace.json` (the repo marketplace).
+Both plugins are listed in `.agents/plugins/marketplace.json`. Preserve the
+marketplace name `braintrust-codex-plugins` and tracing identity
+`trace-codex@braintrust-codex-plugins`.
 
-Key files for the tracing plugin (see [`plugins/trace-codex/AGENTS.md`](plugins/trace-codex/AGENTS.md) for its architecture):
+Key files for the tracing plugin:
 
-- `plugins/trace-codex/AGENTS.md` — architecture and contributor guide for this plugin
+- `plugins/trace-codex/README.md` — architecture and setup guide
 - `plugins/trace-codex/.codex-plugin/plugin.json` — plugin manifest
 - `plugins/trace-codex/hooks/hooks.json` — lifecycle hook config
-- `plugins/trace-codex/src/` — the hook client + event server (compiled to `bin/codex-hook`)
+- Tracing hooks forward to `bt trace hook --source codex`; there is no bundled runtime.
 
 ## Making changes
 
+- **MCP metadata**: edit `plugins/braintrust/plugin.json` and `mcp.json` in the
+  source monorepo. Keep portable identity and OpenAI presentation in one manifest.
+  Keep server-level auth extensions out of the Codex `mcp.json`: current Codex
+  rejects them. The monorepo ZIP builder adds OAuth DCR metadata only to the
+  OpenAI submission archive and validates both formats separately.
 - **Plugin metadata**: edit `plugins/trace-codex/.codex-plugin/plugin.json`.
 - **Marketplace**: edit `.agents/plugins/marketplace.json` to change the plugin entry, category, or install policy.
 
 ## Releasing a new version
 
-1. Bump `"version"` in the relevant plugin's `.codex-plugin/plugin.json`.
-2. Commit, tag, and create a GitHub release (see README for exact commands).
-3. Do **not** skip the git tag — releases are tracked via tags so users can see a changelog.
+Make all source changes in `braintrustdata/braintrust-coding-agent-plugins`.
+Both packages share the Codex distribution version. Use the monorepo's reviewed
+Release Plugin workflow; do not edit or tag this generated repository manually.
+The distribution release carries an MCP-only ZIP for manual OpenAI submission.
+Template settings belong to portal setup, not speculative manifest fields.

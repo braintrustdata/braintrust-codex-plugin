@@ -1,6 +1,6 @@
 {
   "name": "trace-codex",
-  "version": "2.1.1",
+  "version": "2.2.0",
   "description": "Trace Codex sessions to Braintrust (session, turn, and tool spans).",
   "author": {
     "name": "Braintrust",

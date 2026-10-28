@@ -1,0 +1,39 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "braintrust",
+  "version": "2.2.0",
+  "description": "Explore Braintrust traces, manage prompts and datasets, and run evaluations.",
+  "author": {
+    "name": "Braintrust",
+    "email": "support@braintrust.dev",
+    "url": "https://www.braintrust.dev/"
+  },
+  "homepage": "https://www.braintrust.dev/docs/integrations/developer-tools/mcp",
+  "repository": "https://github.com/braintrustdata/braintrust-coding-agent-plugins",
+  "license": "MIT",
+  "keywords": ["braintrust", "evaluations", "observability", "mcp"],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Braintrust",
+        "shortDescription": "Explore traces and run evals",
+        "longDescription": "Query production traces, investigate failures, manage prompts and datasets, and run evaluations in Braintrust. Sign in with a Braintrust account to access your organization's data. Tools use your account's permissions and can read or modify data. This package connects to Braintrust's US data plane.",
+        "developerName": "Braintrust",
+        "category": "Developer Tools",
+        "capabilities": ["Read", "Write"],
+        "websiteURL": "https://www.braintrust.dev/",
+        "supportURL": "https://www.braintrust.dev/docs/kb/troubleshooting-guides",
+        "privacyPolicyURL": "https://www.braintrust.dev/legal/privacy-policy",
+        "termsOfServiceURL": "https://www.braintrust.dev/legal/terms-of-service",
+        "defaultPrompt": [
+          "Show me my Braintrust projects.",
+          "Summarize recent errors in my Braintrust project.",
+          "Compare the results of two experiments in my Braintrust project."
+        ],
+        "brandColor": "#2C1FEB",
+        "composerIcon": "./assets/icon.png",
+        "logo": "./assets/icon.png"
+      }
+    }
+  }
+}
