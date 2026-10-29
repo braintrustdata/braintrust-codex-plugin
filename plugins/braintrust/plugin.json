@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "braintrust",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Explore Braintrust traces, manage prompts and datasets, and run evaluations.",
   "author": {
     "name": "Braintrust",
@@ -17,7 +17,7 @@
       "interface": {
         "displayName": "Braintrust",
         "shortDescription": "Explore traces and run evals",
-        "longDescription": "Query production traces, investigate failures, manage prompts and datasets, and run evaluations in Braintrust. Sign in with a Braintrust account to access your organization's data. Tools use your account's permissions and can read or modify data. This package connects to Braintrust's US data plane.",
+        "longDescription": "Braintrust is the observability platform for understanding and improving AI agents. Explore production traces to surface recurring issues, construct datasets, write and test scorers, run evals to compare changes, and set up alerts to monitor production. ChatGPT acts with your Braintrust account's permissions, including write access.",
         "developerName": "Braintrust",
         "category": "Developer Tools",
         "capabilities": ["Read", "Write"],
