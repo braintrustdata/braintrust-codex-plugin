@@ -1,7 +1,7 @@
 # Braintrust
 
 Query traces, investigate failures, manage prompts and datasets, and run
-evaluations using the hosted [Braintrust MCP server](https://www.braintrust.dev/docs/integrations/developer-tools/mcp).
+evaluations using the hosted [Braintrust MCP server](https://docs.braintrust.dev/integrations/developer-tools/mcp).
 Requires a Braintrust account with access to your organization's data plane.
 Tools use that account's permissions and can read or change Braintrust data.
 
@@ -75,7 +75,7 @@ This package has not been approved or submitted.
 
 ## Support and package assets
 
-See [Braintrust troubleshooting](https://www.braintrust.dev/docs/kb/troubleshooting-guides)
+See [Braintrust troubleshooting](https://docs.braintrust.dev/kb/troubleshooting-guides)
 or contact [support@braintrust.dev](mailto:support@braintrust.dev).
 [Privacy policy](https://www.braintrust.dev/legal/privacy-policy) ·
 [Terms of service](https://www.braintrust.dev/legal/terms-of-service).
